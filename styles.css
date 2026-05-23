@@ -2,6 +2,10 @@
   display: none;
 }
 
+.osync-clickable {
+  cursor: pointer;
+}
+
 .osync-setting-hint {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
