@@ -78,7 +78,7 @@ Osync는 모바일을 포함한 모든 기기에서 Obsidian 볼트를 동기화
 ## 초기 설정
 
 1. **설정** → **Osync** 열기
-2. 서버 URL 입력 (셀프호스팅 또는 Osync Cloud)
+2. 서버 URL 입력
 3. 로그인 또는 계정 생성
 4. 새 볼트 생성 또는 기존 볼트 연결
 5. 볼트 비밀번호 설정 — 이 비밀번호가 암호화의 핵심
@@ -95,8 +95,8 @@ Osync는 완전히 셀프호스팅이 가능합니다. 서버는 Docker 이미�
 
 ```bash
 # 1. 설정 파일 다운로드
-curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/master/docker-compose.yml
-curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/master/.env.example
+curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/.env.example
 cp .env.example .env
 ```
 

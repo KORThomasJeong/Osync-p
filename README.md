@@ -78,7 +78,7 @@ If you install Osync through [BRAT](https://github.com/TfTHacker/obsidian42-brat
 ## Setup
 
 1. Open **Settings** → **Osync**
-2. Enter your server URL (self-hosted or Osync Cloud)
+2. Enter your server URL
 3. Sign in or create an account
 4. Create a new vault or connect to an existing one
 5. Set a strong vault password — this is the key to your encryption
@@ -95,8 +95,8 @@ Osync is fully self-hostable. The server is distributed as a Docker image — no
 
 ```bash
 # 1. Download the config files
-curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/master/docker-compose.yml
-curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/master/.env.example
+curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/.env.example
 cp .env.example .env
 ```
 
