@@ -87,7 +87,91 @@ If you install Osync through [BRAT](https://github.com/TfTHacker/obsidian42-brat
 
 ## Self-Hosting
 
-Osync is fully self-hostable. The server source code is available for users who want to run their own instance. See the server repository for setup instructions.
+Osync is fully self-hostable. The server is distributed as a Docker image — no source code needed.
+
+**Requirements:** Docker, Docker Compose, `openssl`
+
+### Quick Start
+
+```bash
+# 1. Download the config files
+curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/master/docker-compose.yml
+curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/master/.env.example
+cp .env.example .env
+```
+
+```bash
+# 2. Fill in your secrets (replace every CHANGE_ME value)
+# Required secrets to generate:
+echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)"
+echo "SYNC_TOKEN_SECRET=$(openssl rand -hex 32)"
+echo "MINIO_KMS_SECRET_KEY=osync-key:$(openssl rand -base64 32)"
+```
+
+```bash
+# 3. Start
+docker compose up -d
+
+# 4. Check health
+curl http://localhost:3000/health
+```
+
+The admin account is created automatically on first start using `ADMIN_EMAIL` / `ADMIN_PASSWORD` from `.env`. Remove those variables after the first successful login.
+
+### Docker Image
+
+```
+docker pull thomasjeong/osync:latest
+```
+
+Supports `linux/amd64` and `linux/arm64`.
+
+### Ports
+
+| Port | Service |
+|------|---------|
+| `3000` | Osync API (configurable via `PORT=`) |
+| `127.0.0.1:9001` | MinIO admin console (localhost only) |
+
+PostgreSQL (5432) and MinIO S3 (9000) are not exposed externally.
+
+### Reverse Proxy (HTTPS)
+
+**Caddy:**
+```
+your-domain.com {
+    reverse_proxy localhost:3000
+}
+```
+
+**Nginx:**
+```nginx
+server {
+    listen 443 ssl;
+    server_name your-domain.com;
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+}
+```
+
+### Admin UI
+
+Access at `http://localhost:3000/admin/` to manage users, invite codes, and vault stats.
+
+### Volumes
+
+| Volume | Contents |
+|--------|---------|
+| `postgres_data` | User accounts, vault metadata |
+| `minio_data` | Encrypted vault blobs |
+| `coordinator_data` | Real-time sync state |
+
+> Your vault password is never stored on the server. Only encrypted blobs are stored — the server operator cannot read your notes.
 
 ## Releases
 
