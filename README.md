@@ -94,29 +94,35 @@ Osync is fully self-hostable. The server is distributed as a Docker image — no
 ### Quick Start
 
 ```bash
-# 1. Download the config files
+curl -fsSL https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/install.sh | bash
+```
+
+The install script downloads `docker-compose.yml`, generates random secrets into a new `.env`, starts the stack, and prints the auto-generated admin email and password — **save them, the password is shown only once.**
+
+To customize the admin email or public URL before installing:
+
+```bash
+ADMIN_EMAIL=me@example.com PUBLIC_URL=https://osync.example.com \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/install.sh)"
+```
+
+Re-running the script is safe — an existing `.env` is never overwritten. After your first sign-in, remove `ADMIN_EMAIL` and `ADMIN_PASSWORD` from `.env`.
+
+#### Manual setup
+
+If you'd rather not pipe through bash:
+
+```bash
 curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/docker-compose.yml
 curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/.env.example
 cp .env.example .env
-```
-
-```bash
-# 2. Fill in your secrets (replace every CHANGE_ME value)
-# Required secrets to generate:
-echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)"
-echo "SYNC_TOKEN_SECRET=$(openssl rand -hex 32)"
-echo "MINIO_KMS_SECRET_KEY=osync-key:$(openssl rand -base64 32)"
-```
-
-```bash
-# 3. Start
+# Edit .env — replace every CHANGE_ME and generate secrets:
+#   BETTER_AUTH_SECRET=$(openssl rand -hex 32)
+#   SYNC_TOKEN_SECRET=$(openssl rand -hex 32)
+#   MINIO_KMS_SECRET_KEY=osync-key:$(openssl rand -base64 32)
 docker compose up -d
-
-# 4. Check health
 curl http://localhost:3000/health
 ```
-
-The admin account is created automatically on first start using `ADMIN_EMAIL` / `ADMIN_PASSWORD` from `.env`. Remove those variables after the first successful login.
 
 ### Docker Image
 

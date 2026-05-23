@@ -94,29 +94,35 @@ Osync는 완전히 셀프호스팅이 가능합니다. 서버는 Docker 이미�
 ### 빠른 시작
 
 ```bash
-# 1. 설정 파일 다운로드
+curl -fsSL https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/install.sh | bash
+```
+
+스크립트가 `docker-compose.yml`을 받고, 무작위 시크릿이 채워진 `.env`를 새로 만들고, 스택을 띄운 뒤 자동 생성된 어드민 이메일/비밀번호를 출력합니다. **비밀번호는 단 한 번만 표시되니 반드시 보관하세요.**
+
+어드민 이메일이나 공개 URL을 미리 지정하고 싶다면:
+
+```bash
+ADMIN_EMAIL=me@example.com PUBLIC_URL=https://osync.example.com \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/install.sh)"
+```
+
+스크립트는 재실행해도 안전합니다 — 기존 `.env`는 절대 덮어쓰지 않습니다. 첫 로그인 후에는 `.env`의 `ADMIN_EMAIL` / `ADMIN_PASSWORD`를 삭제하세요.
+
+#### 수동 설치
+
+bash로 파이프해서 실행하기 싫다면:
+
+```bash
 curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/docker-compose.yml
 curl -O https://raw.githubusercontent.com/KORThomasJeong/Osync-p/main/.env.example
 cp .env.example .env
-```
-
-```bash
-# 2. .env 파일 편집 — CHANGE_ME 항목을 모두 교체
-# 보안 키 자동 생성 명령어:
-echo "BETTER_AUTH_SECRET=$(openssl rand -hex 32)"
-echo "SYNC_TOKEN_SECRET=$(openssl rand -hex 32)"
-echo "MINIO_KMS_SECRET_KEY=osync-key:$(openssl rand -base64 32)"
-```
-
-```bash
-# 3. 시작
+# .env 편집 — CHANGE_ME 항목 교체 + 시크릿 생성:
+#   BETTER_AUTH_SECRET=$(openssl rand -hex 32)
+#   SYNC_TOKEN_SECRET=$(openssl rand -hex 32)
+#   MINIO_KMS_SECRET_KEY=osync-key:$(openssl rand -base64 32)
 docker compose up -d
-
-# 4. 동작 확인
 curl http://localhost:3000/health
 ```
-
-어드민 계정은 `.env`의 `ADMIN_EMAIL` / `ADMIN_PASSWORD`를 기반으로 최초 실행 시 자동 생성됩니다. 첫 로그인 후 해당 항목을 `.env`에서 제거하세요.
 
 ### Docker 이미지
 
