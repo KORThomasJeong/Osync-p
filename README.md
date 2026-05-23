@@ -71,6 +71,10 @@ Download the latest release assets and place them in your vault's `.obsidian/plu
 
 Then enable the plugin in **Settings** → **Community plugins**.
 
+### Installing via BRAT
+
+If you install Osync through [BRAT](https://github.com/TfTHacker/obsidian42-brat), sign in normally after installation. If you previously installed Osync via BRAT and are reinstalling, **delete the existing Osync entry from BRAT before adding it again** — stale authentication stored by BRAT can cause a 403 error on the first sign-in attempt.
+
 ## Setup
 
 1. Open **Settings** → **Osync**
