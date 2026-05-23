@@ -1,5 +1,7 @@
 # Osync
 
+**[한국어](README.ko.md)** | English
+
 End-to-end encrypted vault sync plugin for Obsidian.
 
 ## Overview
