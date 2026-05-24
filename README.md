@@ -110,6 +110,54 @@ ADMIN_EMAIL=me@example.com PUBLIC_URL=https://osync.example.com \
 
 Re-running the script is safe — an existing `.env` is never overwritten. After your first sign-in, remove `ADMIN_EMAIL` and `ADMIN_PASSWORD` from `.env`.
 
+#### First-time deploy walkthrough (recommended)
+
+The end-to-end procedure for a fresh 2.1.7 deployment:
+
+1. **Pick subdomains.** Decide on two sibling subdomains under your existing domain, e.g.
+   - `osync.your-domain.com` → API
+   - `osync-s3.your-domain.com` → MinIO S3
+
+   Both should sit at the same depth so Cloudflare's free Universal SSL (which covers `*.your-domain.com`) automatically issues their certificates. Avoid deeper names like `s3.osync.your-domain.com` unless you have a paid wildcard.
+
+2. **Point DNS.** Add an A/AAAA record (or CNAME) for each subdomain pointing at your server's IP. If using Cloudflare, leave the proxy (orange cloud) on; the orange cloud also handles TLS at the edge.
+
+3. **Provision the reverse proxy** (e.g., Nginx Proxy Manager):
+   - Create proxy host 1: `osync.your-domain.com` → `osync-api:3000` (or `localhost:3000` depending on your network setup). In the Advanced tab, paste the API nginx snippet from the "Reverse Proxy (HTTPS)" section below. Enable SSL with Let's Encrypt or your existing cert.
+   - Create proxy host 2: `osync-s3.your-domain.com` → `minio:9000` (or `localhost:9000`). In the Advanced tab, paste the MinIO nginx snippet. Enable SSL.
+   - Both hosts MUST have buffering off and unlimited body size (see snippets in the next section).
+
+4. **Configure `.env`.** After `curl`ing the example or running the install script, edit `.env`:
+   ```
+   PUBLIC_URL=https://osync.your-domain.com
+   CORS_ORIGIN=https://osync.your-domain.com
+   S3_PUBLIC_ENDPOINT=https://osync-s3.your-domain.com
+   MINIO_PUBLIC_URL=https://osync-s3.your-domain.com
+   ```
+   `S3_PUBLIC_ENDPOINT` is what the API server uses when signing presigned URLs. `MINIO_PUBLIC_URL` is forwarded to MinIO as `MINIO_SERVER_URL` so MinIO's own redirects/console match. They should be identical.
+
+5. **Bring up the stack:**
+   ```bash
+   docker compose pull
+   docker compose up -d
+   docker compose logs -f api
+   ```
+   Look for `[i18n] language=...` and `[osync] API running on http://localhost:3000`. Wait for postgres + MinIO health checks.
+
+6. **Smoke-test:**
+   ```bash
+   # API reachable through your domain
+   curl -fsSI https://osync.your-domain.com/health
+
+   # MinIO reachable through its subdomain (will return XML 403 — that's expected; just confirms the proxy + TLS work)
+   curl -fsSI https://osync-s3.your-domain.com/
+   ```
+   If either fails, fix the reverse proxy before going further.
+
+7. **First sign-in.** The first-run admin email/password were printed by the install script (the password was shown only once — if you lost it, set `ADMIN_PASSWORD` in `.env` and restart once). Sign in at `https://osync.your-domain.com/admin/`, create an invite code, then sign up on `https://osync.your-domain.com/signup/`.
+
+8. **Install the plugin.** Obsidian → Settings → Community plugins → search **Osync** → install + enable. In plugin settings, point the server URL at `https://osync.your-domain.com`, sign in, create or connect a vault.
+
 #### Manual setup
 
 If you'd rather not pipe through bash:
@@ -217,6 +265,22 @@ location / {
     client_max_body_size 0;
 }
 ```
+
+### Troubleshooting
+
+- **`SignatureDoesNotMatch` on upload/download** — `MINIO_PUBLIC_URL` or `S3_PUBLIC_ENDPOINT` doesn't exactly match the host clients hit, OR your reverse proxy isn't passing `Host $host` to MinIO. Verify both env vars equal the public URL of `osync-s3.your-domain.com`, and that the MinIO Nginx block has `proxy_set_header Host $host;`.
+
+- **`RequestTimeTooSkewed`** — server clock drift greater than 15 minutes. Fix with `timedatectl set-ntp true` (or your OS equivalent).
+
+- **502 Bad Gateway on `osync-s3.*`** — proxy can't resolve `minio:9000`. If Nginx is in a different Docker network than MinIO, either join the same network or use `localhost:9000` (if MinIO is bound to the host) instead of the service name.
+
+- **Uploads hang or fail with `413 Request Entity Too Large`** — nginx is buffering and limiting. Confirm `proxy_request_buffering off`, `proxy_buffering off`, and `client_max_body_size 0` on **both** vhosts. Caddy: ensure `request_body { max_size 0 }`.
+
+- **Sync stops when the mobile app goes background** — expected. Mobile OSes suspend WebViews; the WebSocket dies. Sync resumes when Obsidian becomes visible again. Not a bug.
+
+- **Plugin shows "json parse error" right after upgrading** — usually means the API container failed mid-WebSocket. Check `docker compose logs api` for stack traces. If it mentions `meta/_journal.json`, your image is older than `2.1.6+drizzle-do-fix`; pull `thomasjeong/osync:latest` and restart.
+
+- **Self-hosters running on a single machine without subdomains** — leave `S3_PUBLIC_ENDPOINT` and `MINIO_PUBLIC_URL` **empty**; the server falls back to `S3_ENDPOINT` (the internal MinIO URL) for presigning. Presigned URLs will then point at `http://minio:9000` which only the API container itself can reach, so blob transfers will only work from a client running on the same host. Use the subdomain setup for any real deployment.
 
 ### Admin UI
 

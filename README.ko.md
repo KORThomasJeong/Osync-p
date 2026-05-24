@@ -110,6 +110,54 @@ ADMIN_EMAIL=me@example.com PUBLIC_URL=https://osync.example.com \
 
 스크립트는 재실행해도 안전합니다 — 기존 `.env`는 절대 덮어쓰지 않습니다. 첫 로그인 후에는 `.env`의 `ADMIN_EMAIL` / `ADMIN_PASSWORD`를 삭제하세요.
 
+#### 첫 배포 가이드 (권장)
+
+새로 2.1.7을 배포할 때 따라야 할 전체 순서:
+
+1. **서브도메인 두 개 정하기.** 보유 중인 도메인 아래에 형제 관계인 서브도메인 두 개를 정합니다. 예:
+   - `osync.your-domain.com` → API
+   - `osync-s3.your-domain.com` → MinIO S3
+
+   두 도메인은 같은 깊이에 두세요. Cloudflare 무료 Universal SSL이 `*.your-domain.com`을 자동으로 커버하므로 인증서가 별도 작업 없이 발급됩니다. `s3.osync.your-domain.com`처럼 더 깊은 이름은 유료 와일드카드가 없는 한 피하세요.
+
+2. **DNS 설정.** 각 서브도메인을 서버 IP로 가리키는 A/AAAA 레코드(또는 CNAME)를 추가합니다. Cloudflare를 쓴다면 프록시(주황 구름)는 켜둔 채로 두세요 — 엣지에서 TLS까지 처리됩니다.
+
+3. **리버스 프록시 설정** (예: Nginx Proxy Manager):
+   - 프록시 호스트 1 생성: `osync.your-domain.com` → `osync-api:3000` (네트워크 구성에 따라 `localhost:3000`). Advanced 탭에 아래 "리버스 프록시 (HTTPS)" 섹션의 API용 nginx 스니펫을 붙여넣고, SSL은 Let's Encrypt 또는 기존 인증서로 활성화하세요.
+   - 프록시 호스트 2 생성: `osync-s3.your-domain.com` → `minio:9000` (또는 `localhost:9000`). Advanced 탭에 MinIO용 nginx 스니펫을 붙여넣고 SSL을 활성화하세요.
+   - 두 호스트 모두 버퍼링 OFF, 본문 크기 제한 해제는 필수입니다 (다음 섹션 스니펫 참조).
+
+4. **`.env` 구성.** 예시 파일을 `curl`로 받거나 설치 스크립트 실행 후 `.env`를 편집합니다:
+   ```
+   PUBLIC_URL=https://osync.your-domain.com
+   CORS_ORIGIN=https://osync.your-domain.com
+   S3_PUBLIC_ENDPOINT=https://osync-s3.your-domain.com
+   MINIO_PUBLIC_URL=https://osync-s3.your-domain.com
+   ```
+   `S3_PUBLIC_ENDPOINT`는 API 서버가 presigned URL에 서명할 때 사용하는 값입니다. `MINIO_PUBLIC_URL`은 MinIO 컨테이너의 `MINIO_SERVER_URL`로 전달되어 MinIO 자체의 리다이렉트/콘솔이 매칭되도록 합니다. 두 값은 동일해야 합니다.
+
+5. **스택 기동:**
+   ```bash
+   docker compose pull
+   docker compose up -d
+   docker compose logs -f api
+   ```
+   로그에 `[i18n] language=...` 와 `[osync] API running on http://localhost:3000` 가 보이면 정상입니다. postgres와 MinIO 헬스체크가 끝날 때까지 잠시 기다리세요.
+
+6. **스모크 테스트:**
+   ```bash
+   # 도메인을 통해 API 접근 확인
+   curl -fsSI https://osync.your-domain.com/health
+
+   # MinIO 서브도메인 접근 확인 (XML 403이 떠야 정상 — 프록시 + TLS가 동작한다는 뜻)
+   curl -fsSI https://osync-s3.your-domain.com/
+   ```
+   둘 중 하나라도 실패하면 다음 단계로 넘어가지 말고 리버스 프록시부터 고치세요.
+
+7. **첫 로그인.** 초기 어드민 이메일/비밀번호는 설치 스크립트 출력에 표시되었습니다 (비밀번호는 단 한 번만 표시됩니다 — 잃어버렸다면 `.env`에 `ADMIN_PASSWORD`를 다시 설정하고 한 번 재시작하세요). `https://osync.your-domain.com/admin/` 에서 로그인 후 초대코드를 만들고, `https://osync.your-domain.com/signup/` 에서 가입하세요.
+
+8. **플러그인 설치.** Obsidian → 설정 → 커뮤니티 플러그인 → **Osync** 검색 → 설치 + 활성화. 플러그인 설정에서 서버 URL을 `https://osync.your-domain.com` 으로 지정하고 로그인한 뒤 볼트를 생성하거나 연결하세요.
+
 #### 수동 설치
 
 bash로 파이프해서 실행하기 싫다면:
@@ -217,6 +265,22 @@ location / {
     client_max_body_size 0;
 }
 ```
+
+### 트러블슈팅
+
+- **업/다운로드 시 `SignatureDoesNotMatch`** — `MINIO_PUBLIC_URL` 또는 `S3_PUBLIC_ENDPOINT`가 클라이언트가 실제로 접속하는 호스트와 정확히 일치하지 않거나, 리버스 프록시가 MinIO로 `Host $host`를 넘기지 않는 경우입니다. 두 환경변수가 `osync-s3.your-domain.com`의 공개 URL과 일치하는지, 그리고 MinIO Nginx 블록에 `proxy_set_header Host $host;`가 있는지 확인하세요.
+
+- **`RequestTimeTooSkewed`** — 서버 시계 오차가 15분 이상입니다. `timedatectl set-ntp true` (또는 OS에 맞는 명령)로 해결하세요.
+
+- **`osync-s3.*` 에서 502 Bad Gateway** — 프록시가 `minio:9000`을 resolve 하지 못한 경우입니다. Nginx가 MinIO와 다른 Docker 네트워크에 있다면 같은 네트워크에 합류시키거나, MinIO가 호스트에 바인딩되어 있다면 서비스 이름 대신 `localhost:9000`을 쓰세요.
+
+- **업로드가 멈추거나 `413 Request Entity Too Large` 로 실패** — nginx가 본문을 버퍼링하고 크기를 제한하고 있습니다. **두 vhost 모두에** `proxy_request_buffering off`, `proxy_buffering off`, `client_max_body_size 0`이 들어가 있는지 확인하세요. Caddy라면 `request_body { max_size 0 }`이 있는지 확인.
+
+- **모바일 앱이 백그라운드로 가면 동기화가 멈춤** — 정상 동작입니다. 모바일 OS는 WebView를 일시정지시키므로 WebSocket이 끊깁니다. Obsidian이 다시 보이면 동기화가 재개됩니다. 버그가 아닙니다.
+
+- **업그레이드 직후 플러그인이 "json parse error" 표시** — API 컨테이너가 WebSocket 중간에 죽었을 가능성이 큽니다. `docker compose logs api`에서 스택 트레이스를 확인하세요. `meta/_journal.json`이 언급된다면 이미지가 `2.1.6+drizzle-do-fix`보다 오래된 것이니 `thomasjeong/osync:latest`를 pull한 뒤 재시작하세요.
+
+- **서브도메인 없이 단일 머신에서 셀프호스팅하는 경우** — `S3_PUBLIC_ENDPOINT`와 `MINIO_PUBLIC_URL`을 **비워두면** 서버가 presigning용 주소로 `S3_ENDPOINT` (내부 MinIO URL)를 사용합니다. 이 경우 presigned URL은 `http://minio:9000`을 가리키게 되어 API 컨테이너 자신에게서만 접근 가능합니다. 결과적으로 같은 호스트에서 도는 클라이언트만 블롭 전송이 가능하니, 실제 배포에서는 반드시 서브도메인 구성을 사용하세요.
 
 ### 어드민 UI
 
