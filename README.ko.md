@@ -122,9 +122,13 @@ cp .env.example .env
 #   BETTER_AUTH_SECRET=$(openssl rand -hex 32)
 #   SYNC_TOKEN_SECRET=$(openssl rand -hex 32)
 #   MINIO_KMS_SECRET_KEY=osync-key:$(openssl rand -base64 32)
+# MinIO presigned URL용 공개 주소도 함께 설정:
+#   MINIO_PUBLIC_URL=https://osync-s3.example.com
 docker compose up -d
 curl http://localhost:3000/health
 ```
+
+> 2.1.7부터 서버는 presigned URL을 발급하고, 플러그인은 암호화된 블롭을 **MinIO에 직접** 업/다운로드합니다 (API 서버를 거치지 않음). 따라서 `.env`에 `MINIO_PUBLIC_URL=https://osync-s3.example.com` 같은 공개 URL을 반드시 지정해야 하며, `docker-compose.yml`은 이 값을 MinIO 컨테이너의 `MINIO_SERVER_URL`로 전달합니다. 이 값이 실제 공개 호스트와 일치해야 presigned 서명이 맞습니다.
 
 ### Docker 이미지
 
@@ -136,34 +140,81 @@ docker pull thomasjeong/osync:latest
 
 ### 포트
 
-| 포트 | 서비스 |
-|------|--------|
-| `3000` | Osync API (`.env`의 `PORT=`로 변경 가능) |
-| `127.0.0.1:9001` | MinIO 관리 콘솔 (로컬호스트 전용) |
+| 포트 | 서비스 | 외부 노출 방식 |
+|------|--------|----------------|
+| `3000` | Osync API (`.env`의 `PORT=`로 변경 가능) | API용 서브도메인 리버스 프록시 (예: `osync.example.com`) |
+| `9000` | MinIO S3 API | 전용 서브도메인 리버스 프록시 (예: `osync-s3.example.com`) |
+| `127.0.0.1:9001` | MinIO 관리 콘솔 | 로컬호스트 전용 (변경 없음) |
+| `5432` | PostgreSQL | 외부 노출 안 함 |
 
-PostgreSQL(5432)과 MinIO S3(9000)는 외부에 노출되지 않습니다.
+> 2.1.7부터는 플러그인이 presigned URL로 직접 MinIO에 접근해야 하므로 MinIO S3 API(`9000`)도 **반드시** 공개 서브도메인으로 노출해야 합니다. 단, 9000 포트 자체는 방화벽으로 막고 리버스 프록시 경로만 외부에 공개하세요.
 
 ### 리버스 프록시 (HTTPS)
 
-**Caddy:**
-```
-your-domain.com {
+Osync 2.1.7+는 블롭 전송에 **presigned URL** 방식을 사용합니다. API 서버는 짧게 유효한 서명된 URL만 발급하고, Obsidian 플러그인은 암호화된 바이트를 **MinIO에 직접** 업/다운로드합니다. API 서버는 블롭 본문을 전혀 중계하지 않습니다 — AWS S3 클라이언트와 동일한 구조이며, API 서버의 메모리 사용량이 크게 줄고 처리량이 올라갑니다.
+
+따라서 리버스 프록시에 **서브도메인 두 개**를 설정해야 합니다:
+
+| 서브도메인 | 업스트림 | 역할 |
+|-----------|---------|------|
+| `osync.example.com` | API 컨테이너 `:3000` | REST + WebSocket 코디네이터 |
+| `osync-s3.example.com` | MinIO `:9000` | presigned 블롭 업/다운로드 |
+
+**TLS / 와일드카드 인증서.** Cloudflare의 무료 Universal SSL은 1단계 와일드카드(`*.example.com`)를 커버하므로, `osync.example.com`과 `osync-s3.example.com`처럼 **형제 관계인** 서브도메인 두 개는 무료 인증서로 바로 사용할 수 있습니다. `*.osync.example.com` 같은 더 깊은 와일드카드는 Cloudflare Advanced Certificate Manager(유료) 또는 Let's Encrypt DNS-01 와일드카드가 필요하므로, 그냥 형제 서브도메인을 쓰는 게 편합니다.
+
+**MinIO에 공개 URL을 알려줘야 합니다.** 위 `.env`의 `MINIO_PUBLIC_URL`을 통해 MinIO 컨테이너의 `MINIO_SERVER_URL`을 공개 URL(예: `https://osync-s3.example.com`)과 **정확히** 일치하게 설정하세요. 불일치하면 presigned 서명이 깨져 업로드가 `SignatureDoesNotMatch`로 실패합니다.
+
+**프록시 버퍼링은 반드시 꺼야 합니다.** 암호화된 블롭은 크기가 클 수 있어, 프록시가 본문을 통째로 버퍼링하면 메모리를 잡아먹고 업로드가 멈춥니다. 두 vhost 모두 스트리밍 모드 + 본문 크기 제한 해제가 필요합니다.
+
+**Caddy (권장 — 기본값이 합리적):**
+```caddyfile
+osync.example.com {
     reverse_proxy localhost:3000
+    request_body {
+        max_size 0
+    }
+}
+
+osync-s3.example.com {
+    reverse_proxy localhost:9000 {
+        flush_interval -1
+    }
+    request_body {
+        max_size 0
+    }
 }
 ```
 
-**Nginx:**
+**Nginx (또는 Nginx Proxy Manager의 Advanced 탭):**
 ```nginx
-server {
-    listen 443 ssl;
-    server_name your-domain.com;
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-    }
+# osync.example.com (API + WebSocket)
+location / {
+    proxy_pass http://osync-api:3000;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+    proxy_read_timeout 86400;
+    client_max_body_size 0;
+}
+
+# osync-s3.example.com (MinIO presigned 블롭 전송)
+location / {
+    proxy_pass http://minio:9000;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_connect_timeout 300;
+    proxy_send_timeout 300;
+    proxy_read_timeout 300;
+    client_max_body_size 0;
 }
 ```
 

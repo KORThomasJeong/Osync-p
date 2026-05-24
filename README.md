@@ -122,9 +122,13 @@ cp .env.example .env
 #   BETTER_AUTH_SECRET=$(openssl rand -hex 32)
 #   SYNC_TOKEN_SECRET=$(openssl rand -hex 32)
 #   MINIO_KMS_SECRET_KEY=osync-key:$(openssl rand -base64 32)
+# Also set the public MinIO URL (used for presigned blob uploads/downloads):
+#   MINIO_PUBLIC_URL=https://osync-s3.example.com
 docker compose up -d
 curl http://localhost:3000/health
 ```
+
+> Since 2.1.7, the server hands out presigned URLs so the plugin uploads/downloads encrypted blobs **directly to MinIO**, bypassing the API. `.env` must therefore include `MINIO_PUBLIC_URL=https://osync-s3.example.com` — `docker-compose.yml` passes this through to the MinIO container as `MINIO_SERVER_URL`, which is what makes presigned signatures match the public hostname.
 
 ### Docker Image
 
@@ -136,34 +140,81 @@ Supports `linux/amd64` and `linux/arm64`.
 
 ### Ports
 
-| Port | Service |
-|------|---------|
-| `3000` | Osync API (configurable via `PORT=`) |
-| `127.0.0.1:9001` | MinIO admin console (localhost only) |
+| Port | Service | Public exposure |
+|------|---------|-----------------|
+| `3000` | Osync API (configurable via `PORT=`) | Reverse proxy on the API subdomain (e.g. `osync.example.com`) |
+| `9000` | MinIO S3 API | Reverse proxy on its own subdomain (e.g. `osync-s3.example.com`) |
+| `127.0.0.1:9001` | MinIO admin console | Localhost only (unchanged) |
+| `5432` | PostgreSQL | Not exposed |
 
-PostgreSQL (5432) and MinIO S3 (9000) are not exposed externally.
+> Starting with 2.1.7, MinIO's S3 API (port `9000`) **must** be reachable from clients via its own public subdomain so the plugin can use presigned URLs. Still firewall the raw port — only the reverse proxy should be exposed.
 
 ### Reverse Proxy (HTTPS)
 
-**Caddy:**
-```
-your-domain.com {
+Osync 2.1.7+ uses **presigned URLs** for blob transfer: the API server signs short-lived URLs that point at MinIO, and the Obsidian plugin uploads/downloads the encrypted bytes **directly to MinIO**. The API never proxies blob bodies — this is the same architecture AWS S3 clients use, and it dramatically lowers API memory usage and raises throughput.
+
+That means you need **two subdomains**, each terminated by your reverse proxy:
+
+| Subdomain | Upstream | Purpose |
+|-----------|----------|---------|
+| `osync.example.com` | API container `:3000` | REST + WebSocket coordinator |
+| `osync-s3.example.com` | MinIO `:9000` | Presigned blob uploads/downloads |
+
+**TLS / wildcard certs.** Cloudflare's free Universal SSL covers depth-1 wildcards (`*.example.com`), so two **sibling** subdomains like `osync.example.com` and `osync-s3.example.com` work out of the box with the free cert. Deeper wildcards (e.g. `*.osync.example.com`) require Cloudflare Advanced Certificate Manager (paid) or a Let's Encrypt DNS-01 wildcard — easier to just use siblings.
+
+**MinIO must know its public URL.** Set `MINIO_SERVER_URL` on the MinIO container (via `MINIO_PUBLIC_URL` in `.env`, see above) to exactly the public URL — e.g. `https://osync-s3.example.com`. If this doesn't match, presigned signatures break and uploads fail with `SignatureDoesNotMatch`.
+
+**Proxy buffering must be off.** Encrypted blobs can be large; if the proxy buffers the whole body before forwarding, it eats memory and stalls uploads. Both vhosts need streaming mode and unlimited body size.
+
+**Caddy (preferred — defaults are sane):**
+```caddyfile
+osync.example.com {
     reverse_proxy localhost:3000
+    request_body {
+        max_size 0
+    }
+}
+
+osync-s3.example.com {
+    reverse_proxy localhost:9000 {
+        flush_interval -1
+    }
+    request_body {
+        max_size 0
+    }
 }
 ```
 
-**Nginx:**
+**Nginx (or the Advanced tab in Nginx Proxy Manager):**
 ```nginx
-server {
-    listen 443 ssl;
-    server_name your-domain.com;
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-    }
+# osync.example.com (API + WebSocket)
+location / {
+    proxy_pass http://osync-api:3000;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "Upgrade";
+    proxy_read_timeout 86400;
+    client_max_body_size 0;
+}
+
+# osync-s3.example.com (MinIO presigned blob transfer)
+location / {
+    proxy_pass http://minio:9000;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_connect_timeout 300;
+    proxy_send_timeout 300;
+    proxy_read_timeout 300;
+    client_max_body_size 0;
 }
 ```
 
