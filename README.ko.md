@@ -2,6 +2,12 @@
 
 한국어 | **[English](README.md)**
 
+<p align="center">
+  <a href="https://www.buymeacoffee.com/thomasjeong" target="_blank">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50">
+  </a>
+</p>
+
 Obsidian 볼트를 E2EE(종단간 암호화)로 동기화하는 플러그인.
 
 ## 개요
@@ -70,10 +76,6 @@ Osync는 모바일을 포함한 모든 기기에서 Obsidian 볼트를 동기화
 - `styles.css`
 
 이후 **설정** → **커뮤니티 플러그인**에서 활성화.
-
-### BRAT으로 설치하는 경우
-
-[BRAT](https://github.com/TfTHacker/obsidian42-brat)을 통해 설치한 경우 설치 후 정상적으로 로그인하면 됩니다. 단, **이전에 BRAT으로 설치한 적이 있다면 재설치 전에 BRAT에서 기존 Osync 항목을 먼저 삭제**하세요. BRAT에 남아 있는 인증 정보가 첫 로그인 시 403 오류를 일으킬 수 있습니다.
 
 ## 초기 설정
 

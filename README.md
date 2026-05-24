@@ -2,6 +2,12 @@
 
 **[한국어](README.ko.md)** | English
 
+<p align="center">
+  <a href="https://www.buymeacoffee.com/thomasjeong" target="_blank">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50">
+  </a>
+</p>
+
 End-to-end encrypted vault sync plugin for Obsidian.
 
 ## Overview
@@ -70,10 +76,6 @@ Download the latest release assets and place them in your vault's `.obsidian/plu
 - `styles.css`
 
 Then enable the plugin in **Settings** → **Community plugins**.
-
-### Installing via BRAT
-
-If you install Osync through [BRAT](https://github.com/TfTHacker/obsidian42-brat), sign in normally after installation. If you previously installed Osync via BRAT and are reinstalling, **delete the existing Osync entry from BRAT before adding it again** — stale authentication stored by BRAT can cause a 403 error on the first sign-in attempt.
 
 ## Setup
 
