@@ -3,8 +3,8 @@
 한국어 | **[English](README.md)**
 
 <p align="center">
-  <a href="https://www.buymeacoffee.com/thomasjeong" target="_blank">
-    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50">
+  <a href="https://ko-fi.com/thomasjeong" target="_blank">
+    <img src="https://storage.ko-fi.com/cdn/kofi3.png?v=3" alt="Buy Me a Coffee at ko-fi.com" height="50">
   </a>
 </p>
 
