@@ -4,6 +4,7 @@ import {
   getAvailableConflictCopyPath,
 } from "../core/conflict-file";
 import type { SyncCryptoService } from "../core/crypto-service";
+import { queueLocalDeleteMutation } from "../core/mutation-queue";
 import type { RemoteEntryState } from "../remote/changes";
 import type {
   SyncEntryRow,
@@ -12,6 +13,7 @@ import type {
   SyncEntryStore,
   SyncMutationStore,
 } from "../store/ports";
+import { toPathKey } from "../store/dexie/path-key";
 import { decideConflictWinner } from "./conflict-tiebreak";
 import {
   type AdoptedLocalEntry,
@@ -95,6 +97,12 @@ export class PullManifestPlanner {
         .filter((item) => !isDeferredByCursorThreshold(item, deferredCursorThreshold))
         .map((item) => item.state.entryId),
     );
+    const dedupLosers = this.findIdenticalContentDedupLosers(
+      manifest,
+      deferredCursorThreshold,
+    );
+    // reservedPaths is keyed by NFC path key so two remote entries that differ only by
+    // Unicode normalization form (NFD vs NFC) are treated as the same logical path.
     const reservedPaths = new Map<string, string>();
     const plans: PlannedEntryState[] = [];
     const deferred: PullEntryStateManifestItem[] = [];
@@ -103,6 +111,25 @@ export class PullManifestPlanner {
       const { state, metadata } = item;
       if (isDeferredByCursorThreshold(item, deferredCursorThreshold)) {
         deferred.push(item);
+        continue;
+      }
+
+      if (dedupLosers.has(state.entryId)) {
+        // Identical-content duplicate of another remote entry on the same NFC path
+        // key. The winner keeps the real path; this loser is removed server-side via
+        // a delete mutation instead of producing a .sync-conflict copy.
+        await queueLocalDeleteMutation(store, {
+          crypto: this.deps.crypto,
+          entryId: state.entryId,
+          base: {
+            revision: state.revision,
+            deleted: state.deleted,
+            blobId: state.blobId,
+            hash: metadata.hash,
+          },
+          path: metadata.path,
+          editedAt: metadata.editedAt ?? state.updatedAt,
+        });
         continue;
       }
 
@@ -125,7 +152,7 @@ export class PullManifestPlanner {
           }
           hash = metadata.hash;
 
-          const duplicateEntryId = reservedPaths.get(metadata.path);
+          const duplicateEntryId = reservedPaths.get(toPathKey(metadata.path));
           const pathOwner = await store.getEntryByPath(metadata.path);
           adoptedLocalEntry = pathOwner
             ? await this.findAdoptableLocalPathOwner(store, state, metadata, pathOwner, hash)
@@ -169,7 +196,7 @@ export class PullManifestPlanner {
           if (!finalPath) {
             throw new Error(`Entry state ${state.entryId}@${state.revision} has no target path.`);
           }
-          reservedPaths.set(finalPath, state.entryId);
+          reservedPaths.set(toPathKey(finalPath), state.entryId);
         }
       } else if (state.entryType !== "folder" && metadata.hash !== null) {
         throw new Error(`Deleted entry state ${state.entryId}@${state.revision} has a hash.`);
@@ -188,6 +215,86 @@ export class PullManifestPlanner {
     }
 
     return { plans, deferred };
+  }
+
+  /**
+   * Detects sets of remote entries that resolve to the same NFC path key AND carry
+   * identical content hashes (e.g. one entry stored as NFD, a duplicate stored as NFC).
+   * Such pairs are pure duplicates rather than genuine path conflicts: keeping both would
+   * spawn a redundant .sync-conflict copy. For each identical-content set we pick a
+   * deterministic winner (highest revision -> newest updatedAt -> smallest entryId) to keep
+   * at the real path and return the remaining entryIds as "losers" to be deleted server-side.
+   *
+   * Entries that collide on the NFC path key but differ in content are left untouched here so
+   * the existing conflict-copy path continues to preserve their data.
+   */
+  private findIdenticalContentDedupLosers(
+    manifest: PullEntryStateManifestItem[],
+    deferredCursorThreshold: number | null,
+  ): Set<string> {
+    const byPathKey = new Map<string, PullEntryStateManifestItem[]>();
+    for (const item of manifest) {
+      const { state, metadata } = item;
+      if (
+        isDeferredByCursorThreshold(item, deferredCursorThreshold) ||
+        state.deleted ||
+        state.entryType === "folder" ||
+        !metadata.hash
+      ) {
+        continue;
+      }
+      const pathKey = toPathKey(metadata.path);
+      const group = byPathKey.get(pathKey);
+      if (group) {
+        group.push(item);
+      } else {
+        byPathKey.set(pathKey, [item]);
+      }
+    }
+
+    const losers = new Set<string>();
+    for (const group of byPathKey.values()) {
+      if (group.length < 2) {
+        continue;
+      }
+      const byHash = new Map<string, PullEntryStateManifestItem[]>();
+      for (const item of group) {
+        const hash = item.metadata.hash!;
+        const sameHash = byHash.get(hash);
+        if (sameHash) {
+          sameHash.push(item);
+        } else {
+          byHash.set(hash, [item]);
+        }
+      }
+      for (const sameHash of byHash.values()) {
+        if (sameHash.length < 2) {
+          continue;
+        }
+        const winner = sameHash.reduce((best, candidate) =>
+          this.isDeterministicDedupWinner(candidate.state, best.state) ? candidate : best,
+        );
+        for (const item of sameHash) {
+          if (item.state.entryId !== winner.state.entryId) {
+            losers.add(item.state.entryId);
+          }
+        }
+      }
+    }
+    return losers;
+  }
+
+  private isDeterministicDedupWinner(
+    candidate: RemoteEntryState,
+    incumbent: RemoteEntryState,
+  ): boolean {
+    if (candidate.revision !== incumbent.revision) {
+      return candidate.revision > incumbent.revision;
+    }
+    if (candidate.updatedAt !== incumbent.updatedAt) {
+      return candidate.updatedAt > incumbent.updatedAt;
+    }
+    return candidate.entryId < incumbent.entryId;
   }
 
   private async findAdoptableLocalPathOwner(
@@ -243,11 +350,12 @@ export class PullManifestPlanner {
       path,
       this.deps.now,
     );
-    while (reservedPaths.has(conflictPath)) {
+    while (reservedPaths.has(toPathKey(conflictPath))) {
       conflictPath = await getAvailableConflictCopyPath(
         {
           exists: async (candidate) =>
-            reservedPaths.has(candidate) || (await this.deps.vaultAdapter.exists(candidate)),
+            reservedPaths.has(toPathKey(candidate)) ||
+            (await this.deps.vaultAdapter.exists(candidate)),
         },
         path,
         this.deps.now,
@@ -272,4 +380,4 @@ export class PullManifestPlanner {
 
 export interface PullManifestStore
   extends Pick<SyncEntryStore, "getEntryById" | "getEntryByPath">,
-    Pick<SyncMutationStore, "getDirtyEntryMutation"> {}
+    Pick<SyncMutationStore, "getDirtyEntryMutation" | "replaceDirtyEntry"> {}

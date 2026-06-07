@@ -41,6 +41,8 @@ import {
   toRemoteEntryRow,
   toSyncConnection,
 } from "./mappers";
+import { resolvePathKeyCollision } from "./merge-entries";
+import { toPathKey } from "./path-key";
 import type { EntryRecord, MetadataRecord } from "./records";
 
 export class DexieSyncStore implements SyncStore {
@@ -99,7 +101,10 @@ export class DexieSyncStore implements SyncStore {
   }
 
   async getRemoteStateByPath(path: string): Promise<RemoteSyncEntryRow | null> {
-    const row = await this.db.entries.where("remotePathKey").equals(path).first();
+    const row = await this.db.entries
+      .where("remotePathKey")
+      .equals(toPathKey(path))
+      .first();
     return row?.remoteKnown ? toRemoteEntryRow(row) : null;
   }
 
@@ -146,7 +151,10 @@ export class DexieSyncStore implements SyncStore {
   }
 
   async getLocalStateByPath(path: string): Promise<LocalSyncEntryRow | null> {
-    const row = await this.db.entries.where("localPathKey").equals(path).first();
+    const row = await this.db.entries
+      .where("localPathKey")
+      .equals(toPathKey(path))
+      .first();
     return row?.localKnown ? toLocalEntryRow(row) : null;
   }
 
@@ -209,17 +217,24 @@ export class DexieSyncStore implements SyncStore {
   }
 
   async getEntryByPath(path: string): Promise<SyncEntryRow | null> {
-    const local = await this.db.entries.where("localPathKey").equals(path).first();
+    const pathKey = toPathKey(path);
+    const local = await this.db.entries
+      .where("localPathKey")
+      .equals(pathKey)
+      .first();
     if (local?.localKnown) {
       return toCombinedEntryRow(local);
     }
 
-    const remote = await this.db.entries.where("remotePathKey").equals(path).first();
+    const remote = await this.db.entries
+      .where("remotePathKey")
+      .equals(pathKey)
+      .first();
     if (!remote?.remoteKnown) {
       return null;
     }
 
-    if (remote.localKnown && remote.localPath !== path) {
+    if (remote.localKnown && (remote.localPath === null || toPathKey(remote.localPath) !== pathKey)) {
       return null;
     }
     return toCombinedEntryRow(remote);
@@ -466,6 +481,17 @@ export class DexieSyncStore implements SyncStore {
           `[osync:store-corruption] ConstraintError on entry ${entry.entryId}: ${message}`,
         );
         try {
+          await this.recoverFromPathKeyCollision(entry);
+          console.error(
+            `[osync:store-corruption] auto-merged path-key collision for entry ${entry.entryId}`,
+          );
+          return;
+        } catch (recoveryError) {
+          console.error(
+            `[osync:store-corruption] auto-merge failed for entry ${entry.entryId}: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+          );
+        }
+        try {
           this.corruptionListener?.({
             kind: "constraint_error",
             entryId: entry.entryId,
@@ -479,6 +505,63 @@ export class DexieSyncStore implements SyncStore {
       }
       throw error;
     }
+  }
+
+  /**
+   * Auto-recovers from a ConstraintError raised when {@link putEntry}'s NFC
+   * path key collides with one already held by a different entry (e.g. a macOS
+   * NFD vs server NFC duplicate). Looks up the existing colliding row(s),
+   * merges them with the incoming entry via {@link resolvePathKeyCollision},
+   * then replaces the old rows with the resolved set inside one rw transaction.
+   * Throws if no actual collision is found so the caller falls through to the
+   * corruption listener.
+   */
+  private async recoverFromPathKeyCollision(entry: EntryRecord): Promise<void> {
+    const normalized = normalizeEntryRecord(entry);
+
+    await this.db.transaction("rw", this.db.entries, async () => {
+      const colliders = new Map<string, EntryRecord>();
+
+      if (normalized.localPathKey !== undefined) {
+        const row = await this.db.entries
+          .where("localPathKey")
+          .equals(normalized.localPathKey)
+          .first();
+        if (row && row.entryId !== normalized.entryId) {
+          colliders.set(row.entryId, row);
+        }
+      }
+      if (normalized.remotePathKey !== undefined) {
+        const row = await this.db.entries
+          .where("remotePathKey")
+          .equals(normalized.remotePathKey)
+          .first();
+        if (row && row.entryId !== normalized.entryId) {
+          colliders.set(row.entryId, row);
+        }
+      }
+
+      if (colliders.size === 0) {
+        throw new Error(
+          `No path-key collision found for entry ${normalized.entryId}; cannot auto-recover.`,
+        );
+      }
+
+      const resolved = resolvePathKeyCollision([...colliders.values(), normalized]);
+
+      // Remove the colliding rows and the incoming entry's prior row before
+      // writing the resolved set. Local-only losers dropped by the merge have
+      // no resolved record, so deleting first prevents a stale row lingering.
+      const toDelete = new Set<string>([normalized.entryId, ...colliders.keys()]);
+      for (const record of resolved) {
+        toDelete.delete(record.entryId);
+      }
+      if (toDelete.size > 0) {
+        await this.db.entries.bulkDelete([...toDelete]);
+      }
+
+      await this.db.entries.bulkPut(resolved);
+    });
   }
 
   private async assertRequiredBaseBlob(

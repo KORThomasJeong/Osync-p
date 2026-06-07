@@ -1,6 +1,6 @@
 {
   "name": "osync-obsidian-plugin",
-  "version": "2.1.6",
+  "version": "2.2.0",
   "description": "Self-hosted, end-to-end encrypted vault sync for Obsidian.",
   "main": "main.js",
   "scripts": {
@@ -15,8 +15,8 @@
     "esbuild": "^0.25.0",
     "fake-indexeddb": "^6.2.5",
     "obsidian": "^1.11.4",
-    "typescript": "^5.0.0",
-    "vitest": "^4.1.4"
+    "vitest": "^4.1.4",
+    "typescript": "^5.0.0"
   },
   "dependencies": {
     "dexie": "^4.4.2",

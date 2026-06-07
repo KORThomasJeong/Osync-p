@@ -1,5 +1,7 @@
 import Dexie, { type Table } from "dexie";
 
+import { resolvePathKeyCollision } from "./merge-entries";
+import { toPathKey } from "./path-key";
 import type { BlobRecord, EntryRecord, MetadataRecord } from "./records";
 
 const DB_NAMESPACE_VERSION = "v1";
@@ -54,7 +56,91 @@ export class SyncDexieDatabase extends Dexie {
         }
       });
     });
+    this.version(5).stores({
+      metadata: "&id",
+      entries: ENTRIES_SCHEMA,
+      blobs: "&blobId,hash,role,refEntryId,cachedAt",
+    }).upgrade(async (tx) => {
+      // Raw (NFD on macOS) path keys diverged from the NFC pathToken the server derives,
+      // so &localPathKey / &remotePathKey could carry NFD values that collide once
+      // normalized to NFC. Recompute every key in NFC, merge the records that now share a
+      // key, and rewrite the table atomically so the unique indexes never go transient.
+      const all = await tx.table<EntryRecord>("entries").toArray();
+
+      // Union-find over the NFC keys. A record exposes its NFC localPathKey and/or
+      // remotePathKey (same gating normalizeEntryRecord uses), and a record whose two keys
+      // differ joins both buckets — unioning them so it is resolved exactly once.
+      const parent = new Map<number, number>();
+      const find = (x: number): number => {
+        let root = x;
+        while (parent.get(root) !== root) {
+          root = parent.get(root)!;
+        }
+        let cursor = x;
+        while (parent.get(cursor) !== root) {
+          const next = parent.get(cursor)!;
+          parent.set(cursor, root);
+          cursor = next;
+        }
+        return root;
+      };
+      const union = (a: number, b: number): void => {
+        parent.set(find(a), find(b));
+      };
+
+      const keyToIndex = new Map<string, number>();
+      for (let i = 0; i < all.length; i += 1) {
+        parent.set(i, i);
+      }
+      for (let i = 0; i < all.length; i += 1) {
+        for (const key of nfcKeysOf(all[i])) {
+          const seen = keyToIndex.get(key);
+          if (seen === undefined) {
+            keyToIndex.set(key, i);
+          } else {
+            union(seen, i);
+          }
+        }
+      }
+
+      // Bucket each record under its union-find root, then resolve every group (singletons
+      // included, so their keys are normalized to NFC even when nothing collides).
+      const groups = new Map<number, EntryRecord[]>();
+      for (let i = 0; i < all.length; i += 1) {
+        const root = find(i);
+        const bucket = groups.get(root);
+        if (bucket) {
+          bucket.push(all[i]);
+        } else {
+          groups.set(root, [all[i]]);
+        }
+      }
+
+      const resolved: EntryRecord[] = [];
+      for (const group of groups.values()) {
+        resolved.push(...resolvePathKeyCollision(group));
+      }
+
+      // Clear before bulkPut so a record that adopts another's former NFC key never
+      // violates the unique index mid-migration.
+      await tx.table<EntryRecord>("entries").clear();
+      await tx.table<EntryRecord>("entries").bulkPut(resolved);
+    });
   }
+}
+
+// NFC comparison keys for a record, namespaced by side so a local key and a remote key
+// with the same string don't accidentally merge unrelated records. Mirrors the
+// known/path/!deleted gating in normalizeEntryRecord so grouping matches the stored index.
+function nfcKeysOf(record: EntryRecord): string[] {
+  const keys: string[] = [];
+  if (record.localKnown && record.localPath && !record.localDeleted) {
+    keys.push(`local:${toPathKey(record.localPath)}`);
+  }
+  if (record.remoteKnown && record.remotePath && !record.remoteDeleted) {
+    keys.push(`remote:${toPathKey(record.remotePath)}`);
+  }
+  return keys;
 }
 
 export function syncStoreDbName(localVaultId: string): string {

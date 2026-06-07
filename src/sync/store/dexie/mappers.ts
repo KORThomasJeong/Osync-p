@@ -8,6 +8,7 @@ import type {
   SyncEntryRow,
   SyncEntryStateRow,
 } from "../store";
+import { toPathKey } from "./path-key";
 import type { BlobRecord, EntryRecord, MetadataRecord } from "./records";
 
 export function toSyncConnection(
@@ -72,11 +73,11 @@ export function normalizeEntryRecord(entry: EntryRecord): EntryRecord {
     ...entry,
     remotePathKey:
       entry.remoteKnown && entry.remotePath && !entry.remoteDeleted
-        ? entry.remotePath
+        ? toPathKey(entry.remotePath)
         : undefined,
     localPathKey:
       entry.localKnown && entry.localPath && !entry.localDeleted
-        ? entry.localPath
+        ? toPathKey(entry.localPath)
         : undefined,
   };
 }

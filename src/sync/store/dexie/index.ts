@@ -17,7 +17,10 @@ export async function createDexieSyncStore(plugin: Plugin): Promise<SyncStore> {
   return store;
 }
 
-export async function clearDexieSyncStore(plugin: Plugin): Promise<void> {
+export async function clearDexieSyncStore(
+  plugin: Plugin,
+  opts?: { preserveLocalVaultId?: boolean },
+): Promise<void> {
   const localVaultId = readLocalVaultId(plugin);
   if (localVaultId) {
     // Best-effort: clear table contents in place so even if the DB drop fails
@@ -40,15 +43,22 @@ export async function clearDexieSyncStore(plugin: Plugin): Promise<void> {
     }
     // Attempt to drop the DB to also reclaim storage and reset schema. If
     // this throws (mobile IndexedDB sometimes does), suppress: orphaning the
-    // DB is harmless because clearLocalVaultId below ensures the next
-    // bootstrap creates a fresh DB with a new id.
+    // DB is harmless because the next bootstrap either reuses the preserved id
+    // (re-creating an empty DB under the same name) or, when the id is cleared
+    // below, creates a fresh DB with a new id.
     try {
       await Dexie.delete(syncStoreDbName(localVaultId));
     } catch {
       // Mobile fallback path — tables already cleared above (best-effort).
     }
   }
-  clearLocalVaultId(plugin);
+  // Corruption recovery and the user "Reset local sync state" path preserve the
+  // localVaultId so the device keeps its stable identity (sync token binding,
+  // server-side device record). Explicit unpair paths omit the option to
+  // regenerate a fresh id on the next bootstrap.
+  if (!opts?.preserveLocalVaultId) {
+    clearLocalVaultId(plugin);
+  }
 }
 
 export async function readDexieSyncStoreConnection(

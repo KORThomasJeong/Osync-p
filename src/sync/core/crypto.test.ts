@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   decryptSyncBlob,
   decryptSyncMetadata,
+  derivePathToken,
   encryptSyncBlob,
   encryptSyncMetadata,
 } from "./crypto";
@@ -80,5 +81,26 @@ describe("sync crypto", () => {
     await expect(
       decryptSyncBlob(TEST_VAULT_KEY, encrypted, { blobId: "blob-2" }),
     ).rejects.toThrow();
+  });
+});
+
+describe("derivePathToken", () => {
+  it("yields the same token for NFD and NFC forms of a Korean path", async () => {
+    const nfd = "회의록.md".normalize("NFD");
+    const nfc = "회의록.md".normalize("NFC");
+
+    // macOS hands back NFD while the server derives from NFC; canonicalization
+    // inside derivePathToken must reconcile them to the same token.
+    expect(nfd).not.toBe(nfc);
+    const nfdToken = await derivePathToken(TEST_VAULT_KEY, nfd);
+    const nfcToken = await derivePathToken(TEST_VAULT_KEY, nfc);
+
+    expect(nfdToken).toBe(nfcToken);
+  });
+
+  it("emits a 32-character hex token", async () => {
+    const token = await derivePathToken(TEST_VAULT_KEY, "Folder/note.md");
+
+    expect(token).toMatch(/^[0-9a-f]{32}$/);
   });
 });

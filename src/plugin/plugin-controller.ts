@@ -554,9 +554,11 @@ export class OsyncPluginController implements OsyncSettingsController {
     this.storedSyncConnection = await this.syncController.readStoredConnection();
   }
 
-  private async resetSyncConnection(): Promise<void> {
+  private async resetSyncConnection(
+    opts?: { preserveLocalVaultId?: boolean },
+  ): Promise<void> {
     try {
-      await this.syncController.resetLocalSyncState();
+      await this.syncController.resetLocalSyncState(opts);
       this.storedSyncConnection = null;
     } catch (error) {
       this.notifyError(error, "Local sync state reset failed");
@@ -572,7 +574,11 @@ export class OsyncPluginController implements OsyncSettingsController {
       // storedSyncConnection which resetSyncConnection clears.
       const remoteVaultId = this.remoteVaultManager.getRemoteVaultId();
 
-      await this.resetSyncConnection();
+      // Corruption recovery / user-initiated reset rebuilds the local store but
+      // PRESERVES the localVaultId so the device keeps its stable identity and
+      // sync continues against the same server-side device record instead of
+      // breaking repeatedly.
+      await this.resetSyncConnection({ preserveLocalVaultId: true });
       // resetSyncConnection swallows errors and notifies internally; it only
       // clears storedSyncConnection on success. If still set, the inner reset
       // failed — bail out without re-initializing or showing a success Notice.
@@ -583,8 +589,8 @@ export class OsyncPluginController implements OsyncSettingsController {
         return;
       }
 
-      // The sync token cache is bound to (vaultId, localVaultId). Reset
-      // generates a new localVaultId, so any cached token is now stale.
+      // The sync token cache is bound to (vaultId, localVaultId). The store was
+      // rebuilt, so drop any cached token to force fresh issuance.
       this.syncTokenManager.clear();
 
       // Fresh sync store with download mode; this writes a new SyncConnection

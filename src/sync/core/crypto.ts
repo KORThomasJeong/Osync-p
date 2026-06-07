@@ -75,10 +75,11 @@ export async function derivePathToken(
     false,
     ["sign"],
   );
+  // Canonicalize to NFC so macOS NFD paths derive the same token cross-platform.
   const signature = await crypto.subtle.sign(
     "HMAC",
     key,
-    new TextEncoder().encode(`path-token:v1:${path}`),
+    new TextEncoder().encode(`path-token:v1:${path.normalize("NFC")}`),
   );
   const bytes = new Uint8Array(signature).slice(0, 16);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");

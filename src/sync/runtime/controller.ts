@@ -137,7 +137,7 @@ export class SyncController {
     this.syncEngine.resumeAutoSyncFromPause();
   }
 
-  async resetLocalSyncState(): Promise<void> {
+  async resetLocalSyncState(opts?: { preserveLocalVaultId?: boolean }): Promise<void> {
     this.syncEngine.stopAutoSync();
     this.statusTracker.setStorageStatus(null);
     const store = this.syncEngine.detachStore();
@@ -146,7 +146,7 @@ export class SyncController {
     } catch {
       // Continue clearing persisted sync state even if flushing the old store fails.
     }
-    await clearDexieSyncStore(this.deps.plugin);
+    await clearDexieSyncStore(this.deps.plugin, opts);
     this.statusTracker.setProgress({
       completedEntries: 0,
       totalEntries: 0,

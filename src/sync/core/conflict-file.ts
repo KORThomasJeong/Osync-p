@@ -50,7 +50,7 @@ async function ensureParentDirectories(
   }
 }
 
-function buildConflictCopyPath(
+export function buildConflictCopyPath(
   path: string,
   timestamp: string,
   attempt: number,
@@ -71,7 +71,7 @@ function buildConflictCopyPath(
   return `${baseName}-${attempt + 1}${extension}`;
 }
 
-function formatConflictTimestamp(value: number): string {
+export function formatConflictTimestamp(value: number): string {
   const date = new Date(value);
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
