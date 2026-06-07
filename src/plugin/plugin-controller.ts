@@ -33,6 +33,7 @@ import type { SyncTokenResponse } from "../sync/remote/client";
 import { SyncController } from "../sync/runtime/controller";
 import { VaultKeyCryptoService } from "../sync/core/crypto-service";
 import { SyncTokenManager } from "../sync/remote/token-manager";
+import { readLocalVaultId } from "../sync/store/dexie/local-vault";
 import type { StoredRemoteVaultKeySecret } from "../remote-vault/device-storage";
 import {
   clearStoredRemoteVaultKeySecret,
@@ -93,7 +94,15 @@ export class OsyncPluginController implements OsyncSettingsController {
     getApiBaseUrl: () => this.getApiBaseUrl(),
     getAuthSessionToken: () => this.authManager.getAuthSessionToken(),
     getRemoteVaultId: () => this.remoteVaultManager.getRemoteVaultId(),
-    getLocalVaultId: async () => await this.syncController.readLocalVaultId(),
+    getLocalVaultId: async () => {
+      const fromConnection = await this.syncController.readLocalVaultId();
+      if (fromConnection) return fromConnection;
+      // The store connection is transiently empty during a store reset/reconnect
+      // (the IndexedDB may be mid-delete). Fall back to the persistent device
+      // identity in localStorage so token issuance doesn't fail with "Local vault
+      // ID is not available." while the store re-initializes.
+      return readLocalVaultId(this.plugin);
+    },
   });
   private readonly syncController = new SyncController({
     plugin: this.plugin,

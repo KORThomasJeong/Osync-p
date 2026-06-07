@@ -186,6 +186,13 @@ export class SyncAutoLoop {
 
   private async openRealtimeSession(): Promise<void> {
     try {
+      if (this.state.current === "live") {
+        // Reconnecting after an unexpected session loss (e.g. the store DB was
+        // deleted during a reset, closing the socket while the loop stayed
+        // "live"). Move through reconnect_wait so startConnecting is a valid
+        // transition instead of throwing "Invalid transition: live → connecting".
+        this.state.waitForReconnect();
+      }
       this.state.startConnecting();
       const store = this.deps.getSyncStore();
       if (!store) {

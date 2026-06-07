@@ -44,6 +44,39 @@ describe("SyncAutoLoop local changes", () => {
     await store.close();
   });
 
+  it("opens a realtime session for ad-hoc work when the loop is not running (regression: live → connecting)", async () => {
+    const store = await createInitializedTestSyncStore(createTestPlugin());
+    let openCount = 0;
+    let session: SyncRealtimeSession | null = null;
+    const autoLoop = new SyncAutoLoop({
+      getApiBaseUrl: () => "http://127.0.0.1:8787",
+      getSyncToken: async () => createToken(),
+      getSyncStore: () => store,
+      pushPendingMutations: vi.fn(async () => {}),
+      pullOnce: vi.fn(async () => {}),
+      realtimeClient: createRealtimeClient(
+        () => {
+          openCount += 1;
+        },
+        (nextSession) => {
+          session = nextSession;
+        },
+      ),
+    });
+
+    // No start(): the loop is "stopped". withRealtimeSession must still open a
+    // session without throwing "Invalid transition: live → connecting".
+    const result = await autoLoop.withRealtimeSession(async (activeSession) => {
+      expect(activeSession).toBe(session);
+      return "ok";
+    });
+
+    expect(result).toBe("ok");
+    expect(openCount).toBe(1);
+    autoLoop.stop();
+    await store.close();
+  });
+
   it("debounces local changes into a single push", async () => {
     vi.useFakeTimers();
 
