@@ -399,7 +399,7 @@ export class OsyncPluginController implements OsyncSettingsController {
     const workspace = this.plugin.app.workspace;
     const existing = workspace.getLeavesOfType(OSYNC_CONFLICT_VIEW_TYPE)[0];
     if (existing) {
-      workspace.revealLeaf(existing);
+      await workspace.revealLeaf(existing);
       return;
     }
     const leaf = workspace.getRightLeaf(false);
@@ -410,7 +410,7 @@ export class OsyncPluginController implements OsyncSettingsController {
       type: OSYNC_CONFLICT_VIEW_TYPE,
       active: true,
     });
-    workspace.revealLeaf(leaf);
+    await workspace.revealLeaf(leaf);
   }
 
   async listActiveFileVersions(
@@ -534,7 +534,7 @@ export class OsyncPluginController implements OsyncSettingsController {
       "Osync: sync store conflict detected. Tap for recovery options.",
       0,
     );
-    notice.noticeEl.addEventListener("click", () => {
+    notice.messageEl.addEventListener("click", () => {
       notice.hide();
       new StoreCorruptionModal(this.plugin.app, {
         resetLocalSyncState: () => this.resetLocalSyncStateInPlace(),

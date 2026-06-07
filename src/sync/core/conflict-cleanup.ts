@@ -62,8 +62,8 @@ export async function deleteConflictCopies(
       chunk.map((path) => remover.remove(path)),
     );
     for (let j = 0; j < results.length; j += 1) {
-      const outcome = results[j]!;
-      const path = chunk[j]!;
+      const outcome = results[j];
+      const path = chunk[j];
       if (outcome.status === "fulfilled") {
         successCount += 1;
       } else {

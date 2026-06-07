@@ -41,7 +41,7 @@ export class OsyncVersionHistoryController
       OSYNC_VERSION_HISTORY_VIEW_TYPE,
     )[0];
     if (existing) {
-      this.deps.plugin.app.workspace.revealLeaf(existing);
+      await this.deps.plugin.app.workspace.revealLeaf(existing);
       return;
     }
 
@@ -54,7 +54,7 @@ export class OsyncVersionHistoryController
       type: OSYNC_VERSION_HISTORY_VIEW_TYPE,
       active: true,
     });
-    this.deps.plugin.app.workspace.revealLeaf(leaf);
+    await this.deps.plugin.app.workspace.revealLeaf(leaf);
   }
 
   async listActiveFileVersions(

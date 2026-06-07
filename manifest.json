@@ -1,8 +1,8 @@
 {
   "id": "osync",
   "name": "Osync (Self-Hosted)",
-  "version": "2.2.0",
-  "minAppVersion": "1.4.0",
+  "version": "2.2.1",
+  "minAppVersion": "1.11.4",
   "description": "Self-hosted, end-to-end encrypted vault sync. Run your own server (Docker).",
   "author": "Thomas Jeong",
   "authorUrl": "https://github.com/KORThomasJeong",

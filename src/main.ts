@@ -65,9 +65,9 @@ export default class OsyncPlugin extends Plugin {
     });
   }
 
-  async onunload(): Promise<void> {
+  onunload(): void {
     this.controller?.unloadFileExplorerMarker();
-    await this.controller?.stop();
+    void this.controller?.stop();
   }
 
   private registerConnectivityEvents(controller: OsyncPluginController): void {
@@ -77,8 +77,8 @@ export default class OsyncPlugin extends Plugin {
 
     this.registerDomEvent(window, "online", resume);
     this.registerDomEvent(window, "focus", resume);
-    this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState === "visible") {
+    this.registerDomEvent(activeDocument, "visibilitychange", () => {
+      if (activeDocument.visibilityState === "visible") {
         resume();
       }
     });

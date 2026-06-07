@@ -320,7 +320,7 @@ export class DexieSyncStore implements SyncStore {
       const existingRows = await this.db.entries.bulkGet(ids);
       const recordById = new Map<string, EntryRecord>();
       for (let i = 0; i < ids.length; i++) {
-        const id = ids[i]!;
+        const id = ids[i];
         recordById.set(id, existingRows[i] ?? createEmptyEntryRecord(id));
       }
 

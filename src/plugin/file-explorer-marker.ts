@@ -42,13 +42,13 @@ export class OsyncFileExplorerMarker {
       this.debounceTimer = null;
     }
     this.oversizedPaths.clear();
-    document
+    activeDocument
       .querySelectorAll(".nav-file-title.osync-oversized")
       .forEach((el) => el.classList.remove("osync-oversized"));
   }
 
   private updateDom(): void {
-    document
+    activeDocument
       .querySelectorAll<HTMLElement>(".nav-file-title[data-path]")
       .forEach((el) => {
         const path = el.getAttribute("data-path");

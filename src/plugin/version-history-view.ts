@@ -1,4 +1,4 @@
-import { ItemView, Notice, type WorkspaceLeaf } from "obsidian";
+import { App, ItemView, Modal, Notice, type WorkspaceLeaf } from "obsidian";
 
 import type {
   OsyncEntryVersion,
@@ -29,6 +29,39 @@ export interface VersionHistoryViewController {
   previewActiveFileVersion(versionId: string): Promise<string | null>;
 }
 
+class ConfirmModal extends Modal {
+  private confirmed = false;
+
+  constructor(
+    app: App,
+    private readonly message: string,
+    private readonly confirmLabel: string,
+    private readonly onResult: (confirmed: boolean) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.contentEl.createEl("p", { text: this.message });
+    const buttons = this.contentEl.createDiv({ cls: "modal-button-container" });
+    const cancel = buttons.createEl("button", { text: "Cancel" });
+    cancel.addEventListener("click", () => this.close());
+    const confirm = buttons.createEl("button", {
+      text: this.confirmLabel,
+      cls: "mod-cta",
+    });
+    confirm.addEventListener("click", () => {
+      this.confirmed = true;
+      this.close();
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    this.onResult(this.confirmed);
+  }
+}
+
 export class OsyncVersionHistoryView extends ItemView {
   private requestId = 0;
   private loading = false;
@@ -36,7 +69,7 @@ export class OsyncVersionHistoryView extends ItemView {
   private versions: OsyncEntryVersion[] = [];
   private nextBefore: OsyncEntryVersionCursor | null = null;
   private expandedVersionId: string | null = null;
-  private previewCache = new Map<string, string | null | "loading">();
+  private previewCache = new Map<string, string | null>();
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -281,11 +314,15 @@ export class OsyncVersionHistoryView extends ItemView {
   }
 
   private async restoreVersion(version: OsyncEntryVersion): Promise<void> {
-    if (
-      !confirm(
+    const confirmed = await new Promise<boolean>((resolve) => {
+      new ConfirmModal(
+        this.app,
         `Restore version from ${formatCapturedAt(version.capturedAt)}?`,
-      )
-    ) {
+        "Restore",
+        resolve,
+      ).open();
+    });
+    if (!confirmed) {
       return;
     }
 
