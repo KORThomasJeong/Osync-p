@@ -11,6 +11,7 @@ import {
   SyncLocalReconcileService,
 } from "../engine/local-reconcile-service";
 import { ObsidianSyncVaultAdapter } from "../vault/obsidian-vault-adapter";
+import { classifyReconnectError } from "../remote/reconnect-error";
 import { SyncPullService } from "../engine/pull-service";
 import { SyncPushService } from "../engine/push-service";
 import { SyncHttpClient } from "../remote/http-client";
@@ -76,6 +77,8 @@ export interface SyncEngineDeps {
 export class SyncEngine {
   private syncStore: SyncStore | null = null;
   private corruptionListener: SyncStoreCorruptionListener | null = null;
+  private actionableAttention = false;
+  private lastActionableMessage: string | null = null;
   private localMutationQueue: Promise<void> = Promise.resolve();
   private activeSyncActivities: ActiveSyncActivity[] = [];
   private nextSyncActivityId = 1;
@@ -127,7 +130,11 @@ export class SyncEngine {
       }),
     onConnectionStateChange: (state) => {
       if (state === "reconnecting") {
-        this.deps.setSyncStatus("reconnecting");
+        // Keep an actionable attention state visible while the loop quietly
+        // retries; only show the neutral "reconnecting" status otherwise.
+        if (!this.actionableAttention) {
+          this.deps.setSyncStatus("reconnecting");
+        }
         return;
       }
 
@@ -139,15 +146,29 @@ export class SyncEngine {
       this.deps.setStorageStatus(status);
     },
     onSyncScheduled: () => {
+      this.clearActionableAttention();
       this.deps.setSyncStatus("syncing");
     },
     onIdle: () => {
+      this.clearActionableAttention();
       this.deps.setSyncStatus("up_to_date");
     },
     onError: (error) => {
-      console.error("[osync] auto sync error", error);
+      const classification = classifyReconnectError(error);
+      if (classification.kind === "transient") {
+        // Transient network failures are expected during roaming / backgrounding.
+        // Stay "reconnecting" and keep retrying without alarming the user.
+        console.error("[osync] transient sync error", error);
+        return;
+      }
+
+      this.actionableAttention = true;
       this.deps.setSyncStatus("attention_needed");
-      this.deps.notifyError(error, "Auto sync failed");
+      const message = classification.userMessage ?? "Auto sync failed";
+      if (message !== this.lastActionableMessage) {
+        this.lastActionableMessage = message;
+        this.deps.notify(message);
+      }
     },
   });
   private readonly syncVaultEventHandler = new SyncVaultEventHandler({
@@ -578,6 +599,11 @@ export class SyncEngine {
 
   private hasActiveRemoteActivity(): boolean {
     return this.activeSyncActivities.some((activity) => activity.kind !== "local");
+  }
+
+  private clearActionableAttention(): void {
+    this.actionableAttention = false;
+    this.lastActionableMessage = null;
   }
 
   private requireStore(): SyncStore {

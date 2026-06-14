@@ -74,6 +74,106 @@ describe("AuthManager", () => {
     await expect(readAuthSessionToken(plugin)).resolves.toBe("expired-token");
   });
 
+  it("reverifyIfNeeded does nothing when the session is already verified", async () => {
+    const plugin = new Plugin();
+    await writeAuthSessionToken(plugin, "stored-token");
+    const getAuthenticatedUser = vi.fn(async () => ({
+      userId: "user-1",
+      email: "user@example.com",
+      name: "User One",
+    }));
+    const manager = createManager({
+      plugin,
+      authClient: {
+        getAuthenticatedUser,
+      } as unknown as AuthClient,
+    });
+
+    await manager.initialize();
+    expect(manager.hasAuthenticatedSession()).toBe(true);
+    expect(getAuthenticatedUser).toHaveBeenCalledTimes(1);
+
+    await manager.reverifyIfNeeded();
+
+    expect(getAuthenticatedUser).toHaveBeenCalledTimes(1);
+    expect(manager.hasAuthenticatedSession()).toBe(true);
+  });
+
+  it("reverifyIfNeeded does nothing when there is no stored token", async () => {
+    const plugin = new Plugin();
+    const getAuthenticatedUser = vi.fn(async () => null);
+    const manager = createManager({
+      plugin,
+      authClient: {
+        getAuthenticatedUser,
+      } as unknown as AuthClient,
+    });
+
+    await manager.initialize();
+    expect(getAuthenticatedUser).not.toHaveBeenCalled();
+
+    await manager.reverifyIfNeeded();
+
+    expect(getAuthenticatedUser).not.toHaveBeenCalled();
+    expect(manager.hasAuthenticatedSession()).toBe(false);
+  });
+
+  it("reverifyIfNeeded re-runs get-session and becomes verified when a tokened session was not yet verified", async () => {
+    const plugin = new Plugin();
+    await writeAuthSessionToken(plugin, "stored-token");
+    const getAuthenticatedUser = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("network unreachable"))
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        email: "user@example.com",
+        name: "User One",
+      });
+    const manager = createManager({
+      plugin,
+      authClient: {
+        getAuthenticatedUser,
+      } as unknown as AuthClient,
+    });
+
+    await manager.initialize();
+    expect(manager.hasAuthenticatedSession()).toBe(false);
+    expect(getAuthenticatedUser).toHaveBeenCalledTimes(1);
+
+    await manager.reverifyIfNeeded();
+
+    expect(getAuthenticatedUser).toHaveBeenCalledTimes(2);
+    expect(getAuthenticatedUser).toHaveBeenLastCalledWith(
+      "http://127.0.0.1:8787",
+      "stored-token",
+    );
+    expect(manager.hasAuthenticatedSession()).toBe(true);
+    expect(manager.getAuthStatusLabel()).toBe("Signed in as user@example.com.");
+  });
+
+  it("reverifyIfNeeded stays unverified when get-session keeps failing", async () => {
+    const plugin = new Plugin();
+    await writeAuthSessionToken(plugin, "stored-token");
+    const getAuthenticatedUser = vi.fn(async () => {
+      throw new Error("network unreachable");
+    });
+    const manager = createManager({
+      plugin,
+      authClient: {
+        getAuthenticatedUser,
+      } as unknown as AuthClient,
+    });
+
+    await manager.initialize();
+    expect(manager.hasAuthenticatedSession()).toBe(false);
+    expect(getAuthenticatedUser).toHaveBeenCalledTimes(1);
+
+    await manager.reverifyIfNeeded();
+
+    expect(getAuthenticatedUser).toHaveBeenCalledTimes(2);
+    expect(manager.hasAuthenticatedSession()).toBe(false);
+  });
+
   it("reopens the active device authorization instead of starting another one", async () => {
     const authorization = createAuthorization();
     const delay = createDeferred<void>();

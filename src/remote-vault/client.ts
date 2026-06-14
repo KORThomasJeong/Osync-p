@@ -2,6 +2,7 @@ import {
   defaultHttpClient,
   extractErrorMessage,
   stripTrailingSlash,
+  SyncHttpError,
   type HttpClient,
   type HttpResponseLike,
 } from "../http/request";
@@ -107,7 +108,10 @@ export class RemoteVaultClient {
 
     if (response.status < 200 || response.status >= 300) {
       const message = extractErrorMessage(response.json);
-      throw new Error(message || `vault request failed with status ${response.status}`);
+      throw new SyncHttpError(
+        response.status,
+        message || `vault request failed with status ${response.status}`,
+      );
     }
 
     return response.json as T;

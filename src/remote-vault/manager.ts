@@ -40,6 +40,15 @@ export interface RemoteVaultManagerDeps {
   ) => Promise<void>;
   refreshUi: () => void;
   notify: (message: string) => void;
+  getCachedRemoteVaultSummary?: () => {
+    vaultName: string;
+    activeKeyVersion: number;
+  } | null;
+  saveCachedRemoteVaultSummary?: (summary: {
+    vaultId: string;
+    vaultName: string;
+    activeKeyVersion: number;
+  }) => void;
   remoteVaultClient?: RemoteVaultClient;
 }
 
@@ -107,22 +116,51 @@ export class RemoteVaultManager {
       return;
     }
 
-    const bootstrap = await this.remoteVaultClient.getRemoteVaultBootstrap(
-      this.deps.getApiBaseUrl(),
-      this.deps.getAuthSessionToken(),
-      remoteVaultId,
-    );
-
+    // Restore the session immediately from locally stored material so a restart
+    // with no/flaky network still has an active session. Content crypto only
+    // needs the raw key and token issuance only needs vaultId + key; the display
+    // info (vaultName/activeKeyVersion) is refreshed in the background below.
+    const cached = this.deps.getCachedRemoteVaultSummary?.();
     this.session = {
       summary: {
-        vaultId: bootstrap.vault.id,
-        vaultName: bootstrap.vault.name,
-        activeKeyVersion: bootstrap.vault.activeKeyVersion,
+        vaultId: remoteVaultId,
+        vaultName: cached?.vaultName ?? remoteVaultId,
+        activeKeyVersion: cached?.activeKeyVersion ?? 1,
         bootstrappedAt: new Date().toISOString(),
       },
       remoteVaultKey: storedVaultKey.remoteVaultKey,
     };
     this.deps.refreshUi();
+
+    void this.refreshRestoredVaultSummary(remoteVaultId);
+  }
+
+  private async refreshRestoredVaultSummary(remoteVaultId: string): Promise<void> {
+    try {
+      const bootstrap = await this.remoteVaultClient.getRemoteVaultBootstrap(
+        this.deps.getApiBaseUrl(),
+        this.deps.getAuthSessionToken(),
+        remoteVaultId,
+      );
+
+      // Guard against resurrecting/overwriting a session that was cleared or
+      // swapped to a different vault while the network call was in flight.
+      if (!this.session || this.session.summary.vaultId !== remoteVaultId) {
+        return;
+      }
+
+      this.session.summary.vaultName = bootstrap.vault.name;
+      this.session.summary.activeKeyVersion = bootstrap.vault.activeKeyVersion;
+      this.deps.saveCachedRemoteVaultSummary?.({
+        vaultId: remoteVaultId,
+        vaultName: bootstrap.vault.name,
+        activeKeyVersion: bootstrap.vault.activeKeyVersion,
+      });
+      this.deps.refreshUi();
+    } catch {
+      // Offline / transient network failure is expected here. The session
+      // stays active using the cached/placeholder summary.
+    }
   }
 
   async listRemoteVaults(): Promise<RemoteVaultRecord[]> {

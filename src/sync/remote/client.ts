@@ -2,6 +2,7 @@ import {
   defaultHttpClient,
   extractErrorMessage,
   stripTrailingSlash,
+  SyncHttpError,
   type HttpClient,
 } from "../../http/request";
 
@@ -51,7 +52,10 @@ export class SyncAccessClient {
 
     if (response.status < 200 || response.status >= 300) {
       const message = extractErrorMessage(response.json);
-      throw new Error(message || `sync access request failed with status ${response.status}`);
+      throw new SyncHttpError(
+        response.status,
+        message || `sync access request failed with status ${response.status}`,
+      );
     }
 
     return response.json as T;

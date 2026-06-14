@@ -41,6 +41,10 @@ import {
   writeStoredRemoteVaultKeySecret,
 } from "../remote-vault/device-storage";
 import { RemoteVaultManager } from "../remote-vault/manager";
+import {
+  readCachedRemoteVaultSummary,
+  writeCachedRemoteVaultSummary,
+} from "../remote-vault/summary-cache";
 import { RemoteVaultPasswordChangedError } from "../remote-vault/types";
 import type { SyncConnection } from "../sync/store/store";
 
@@ -88,6 +92,16 @@ export class OsyncPluginController implements OsyncSettingsController {
     },
     notify: (message) => {
       new Notice(message);
+    },
+    getCachedRemoteVaultSummary: () => {
+      const cached = readCachedRemoteVaultSummary(this.pluginDataStore);
+      return cached
+        ? { vaultName: cached.vaultName, activeKeyVersion: cached.activeKeyVersion }
+        : null;
+    },
+    saveCachedRemoteVaultSummary: (summary) => {
+      writeCachedRemoteVaultSummary(this.pluginDataStore, summary);
+      void this.pluginDataStore.save();
     },
   });
   private readonly syncTokenManager = new SyncTokenManager({
@@ -229,14 +243,28 @@ export class OsyncPluginController implements OsyncSettingsController {
       return;
     }
 
-    this.resumeAutoSyncPromise = this.syncController
-      .resumeAutoSync()
+    this.resumeAutoSyncPromise = this.recoverAndResume()
       .catch((error) => {
         this.notifyError(error, "Auto sync resume failed");
       })
       .finally(() => {
         this.resumeAutoSyncPromise = null;
       });
+  }
+
+  private async recoverAndResume(): Promise<void> {
+    await this.authManager.reverifyIfNeeded();
+    if (
+      this.hasAuthenticatedSession() &&
+      !this.hasActiveRemoteVaultSession() &&
+      this.storedRemoteVaultKeySecret
+    ) {
+      // Offline-capable restore: reconstructs the in-memory vault session from
+      // locally stored material and re-initializes the sync store so transient
+      // network loss self-heals without a manual reconnect.
+      await this.tryRestorePersistedRemoteVaultSession();
+    }
+    await this.syncController.resumeAutoSync();
   }
 
   getAuthStatusLabel(): string {

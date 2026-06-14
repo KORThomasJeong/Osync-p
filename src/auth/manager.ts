@@ -48,6 +48,18 @@ export class AuthManager {
     await this.refreshIdentity();
   }
 
+  async reverifyIfNeeded(): Promise<void> {
+    if (this.authSessionVerified) {
+      return;
+    }
+
+    if (!this.authSessionToken.trim()) {
+      return;
+    }
+
+    await this.refreshIdentity();
+  }
+
   getAuthSessionToken(): string {
     return this.authSessionToken;
   }

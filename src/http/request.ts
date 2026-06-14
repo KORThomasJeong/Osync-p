@@ -31,6 +31,16 @@ export class ObsidianHttpClient implements HttpClient {
 
 export const defaultHttpClient: HttpClient = new ObsidianHttpClient();
 
+export class SyncHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "SyncHttpError";
+  }
+}
+
 export function extractErrorMessage(value: unknown): string {
   if (!value || typeof value !== "object") {
     return "";

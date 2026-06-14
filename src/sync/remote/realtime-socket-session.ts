@@ -321,8 +321,10 @@ export class SyncRealtimeSocketSession {
   }
 }
 
-export async function waitForOpen(socket: WebSocket): Promise<void> {
+export async function waitForOpen(socket: WebSocket, timeoutMs = 15_000): Promise<void> {
   await new Promise<void>((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+
     const onOpen = () => {
       cleanup();
       resolve();
@@ -335,8 +337,21 @@ export async function waitForOpen(socket: WebSocket): Promise<void> {
       cleanup();
       reject(new Error("sync websocket closed before the session started"));
     };
+    const onTimeout = () => {
+      cleanup();
+      try {
+        socket.close();
+      } catch {
+        // The connection may already be closed by the platform.
+      }
+      reject(new Error("sync websocket connection timed out before opening"));
+    };
 
     const cleanup = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
       socket.removeEventListener("open", onOpen);
       socket.removeEventListener("error", onError);
       socket.removeEventListener("close", onClose);
@@ -345,6 +360,10 @@ export async function waitForOpen(socket: WebSocket): Promise<void> {
     socket.addEventListener("open", onOpen);
     socket.addEventListener("error", onError);
     socket.addEventListener("close", onClose);
+
+    if (timeoutMs > 0) {
+      timeout = setTimeout(onTimeout, timeoutMs);
+    }
   });
 }
 

@@ -16,6 +16,7 @@ import {
 import type { DeletedSyncEntryRow, SyncConnection } from "../store/store";
 import type { SyncStoreCorruptionListener } from "../store/ports";
 import { MassDeleteGuardError } from "../engine/mass-delete-guard";
+import { classifyReconnectError } from "../remote/reconnect-error";
 import { SyncConflictQueue } from "./conflict-queue";
 import {
   type InitialCollisionPreview,
@@ -214,6 +215,12 @@ export class SyncController {
     } catch (error) {
       if (error instanceof MassDeleteGuardError) {
         this.handleMassDeleteGuard(error);
+        return;
+      }
+      const classification = classifyReconnectError(error);
+      if (classification.kind === "transient") {
+        // Likely offline at startup; connectivity events will retry quietly.
+        this.statusTracker.setStatus("reconnecting");
         return;
       }
       this.statusTracker.setStatus("attention_needed");

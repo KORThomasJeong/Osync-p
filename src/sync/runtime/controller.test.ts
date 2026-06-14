@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SyncTokenResponse } from "../remote/client";
 import { createTestPlugin } from "../../test-support/test-plugin";
+import { SyncHttpError } from "../../http/request";
 import { MassDeleteGuardError } from "../engine/mass-delete-guard";
 import { SyncController } from "./controller";
 import { VaultKeyCryptoService } from "../core/crypto-service";
@@ -113,6 +114,40 @@ describe("SyncController", () => {
     });
     expect(controller.getSyncState()).toBe("attention_needed");
     expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("stays reconnecting and does not notify when initialization fails transiently (offline)", async () => {
+    vi.spyOn(SyncEngine.prototype, "runInitialPullIfRequired").mockRejectedValue(
+      new TypeError("Failed to fetch"),
+    );
+    const startAutoSync = vi
+      .spyOn(SyncEngine.prototype, "startAutoSync")
+      .mockResolvedValue(true);
+    const notifyError = vi.fn();
+
+    const controller = new SyncController(createDeps({ notifyError }));
+    await controller.ensureAutoSyncState();
+
+    expect(controller.getSyncState()).toBe("reconnecting");
+    expect(notifyError).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("sets attention_needed and notifies when initialization fails actionably (401)", async () => {
+    vi.spyOn(SyncEngine.prototype, "runInitialPullIfRequired").mockRejectedValue(
+      new SyncHttpError(401, "unauthorized"),
+    );
+    const notifyError = vi.fn();
+
+    const controller = new SyncController(createDeps({ notifyError }));
+    await controller.ensureAutoSyncState();
+
+    expect(controller.getSyncState()).toBe("attention_needed");
+    expect(notifyError).toHaveBeenCalledTimes(1);
+    expect(notifyError).toHaveBeenCalledWith(
+      expect.any(SyncHttpError),
+      "Auto sync initialization failed",
+    );
   });
 
   it("starts auto sync on resume when the loop is not active", async () => {
