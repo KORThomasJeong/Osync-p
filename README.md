@@ -284,7 +284,20 @@ location / {
 
 ### Admin UI
 
-Access at `http://localhost:3000/admin/` to manage users, invite codes, and vault stats.
+Sign in at `http://localhost:3000/admin/` (or `https://osync.your-domain.com/admin/`) with the admin account created on first run. The dashboard is organized into the following panels:
+
+| Panel | What you can do |
+|-------|-----------------|
+| **Users** | List every account with its role, create new users (user or admin), reset a user's password, and delete a user. Password resets and deletions can fire Telegram notifications (see Settings). |
+| **Invite codes** | Generate signup invite codes, track usage (`used / max`), and revoke, reset, or delete each code. Signup is invite-only, so this is how you let new people register. |
+| **Vault stats** | At-a-glance totals (users, files, storage, average files per user) plus a per-user → per-vault storage breakdown measured **directly from MinIO** (the source of truth). From here you can also purge a vault's deleted-file tombstones to reclaim space. |
+| **Groups** | Create groups, add or remove members, and share vaults across the members of a group. |
+| **Settings** | Configure the Telegram notification integration (bot token + chat ID, with a test button), toggle which events send notifications, and set the default max-uses for new invite codes. |
+| **Notifications** | Browse the recent history of sent notifications. |
+
+> **Notifications are optional.** If you don't configure a Telegram bot under **Settings**, the server simply skips sending them — every other admin feature works without it.
+
+The admin account is created automatically on first run from `ADMIN_EMAIL` / `ADMIN_PASSWORD` (the install script prints the generated password once). After your first sign-in, remove those variables from `.env`.
 
 ### Volumes
 
