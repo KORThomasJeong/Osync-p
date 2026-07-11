@@ -1,8 +1,12 @@
 import type { Plugin, TFile } from "obsidian";
 
 import type { SyncAutoLoop } from "../engine/auto-sync";
+import { DeleteBurstDetector } from "../engine/delete-burst-detector";
 import type { SyncEventRecorder } from "../engine/event-recorder";
 import type { ObsidianSyncVaultAdapter } from "../vault/obsidian-vault-adapter";
+
+const DEFAULT_DELETE_BURST_WINDOW_MS = 10_000;
+const DEFAULT_DELETE_BURST_THRESHOLD = 50;
 
 export interface SyncVaultEventHandlerDeps {
   plugin: Plugin;
@@ -15,10 +19,33 @@ export interface SyncVaultEventHandlerDeps {
   runLocalMutationWork: <T>(work: () => Promise<T>) => Promise<T>;
   hasActiveRemoteVaultSession: () => boolean;
   onError: (error: unknown) => void;
+  // Fired when a burst of live deletes crosses the threshold — a script/tool deleting many
+  // files while Obsidian is open, which the reconcile-only mass-delete guard never sees.
+  onDeleteBurst?: () => void;
+  now?: () => number;
+  deleteBurst?: { windowMs: number; threshold: number };
 }
 
 export class SyncVaultEventHandler {
-  constructor(private readonly deps: SyncVaultEventHandlerDeps) {}
+  private readonly deleteBurstDetector: DeleteBurstDetector;
+  private deleteBurstNotified = false;
+
+  constructor(private readonly deps: SyncVaultEventHandlerDeps) {
+    this.deleteBurstDetector = new DeleteBurstDetector({
+      windowMs: deps.deleteBurst?.windowMs ?? DEFAULT_DELETE_BURST_WINDOW_MS,
+      threshold: deps.deleteBurst?.threshold ?? DEFAULT_DELETE_BURST_THRESHOLD,
+    });
+  }
+
+  private noteDelete(): void {
+    const now = this.deps.now?.() ?? Date.now();
+    if (this.deleteBurstDetector.record(now)) {
+      if (!this.deleteBurstNotified) {
+        this.deleteBurstNotified = true;
+        this.deps.onDeleteBurst?.();
+      }
+    }
+  }
 
   register(): void {
     const { plugin } = this.deps;
@@ -130,17 +157,58 @@ export class SyncVaultEventHandler {
         this.run(async () => {
           const changed = await this.deps.eventRecorder.recordDelete(path);
           this.notifyLocalChangeIfNeeded(changed);
+          if (changed) {
+            this.noteDelete();
+          }
         });
       }),
     );
   }
 
+  // Re-record a path whose event was dropped while it was suppressed during a pull's
+  // write window. Reads the current disk state: an existing file/folder becomes an
+  // upsert, a vanished path becomes a delete — so a user edit or delete that landed
+  // mid-pull is not lost until the next full reconcile.
+  replayPath(path: string): void {
+    this.run(async () => {
+      const file = this.deps.plugin.app.vault.getAbstractFileByPath(path);
+      if (!file) {
+        if (this.deps.vaultAdapter.isSyncablePath(path)) {
+          const changed = await this.deps.eventRecorder.recordDelete(path);
+          this.notifyLocalChangeIfNeeded(changed);
+        }
+        return;
+      }
+
+      const syncableFolder = this.deps.vaultAdapter.asSyncableFolder(file);
+      if (syncableFolder) {
+        const changed = await this.deps.eventRecorder.recordFolderUpsert(syncableFolder.path);
+        this.notifyLocalChangeIfNeeded(changed);
+        return;
+      }
+
+      const syncableFile = this.deps.vaultAdapter.asSyncableFile(file);
+      if (syncableFile) {
+        await this.recordUpsert(syncableFile.path, syncableFile);
+      }
+    });
+  }
+
   private async recordUpsert(path: string, file: TFile): Promise<void> {
-    const changed = await this.deps.eventRecorder.recordUpsert(
-      path,
-      await this.deps.vaultAdapter.readFile(file),
-      file.stat,
-    );
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.deps.vaultAdapter.readFile(file);
+    } catch (error) {
+      // The file was removed between the vault event and this deferred read — common with
+      // atomic saves (write temp → rename → delete) and build scripts. This is benign: a
+      // delete event follows for the real target, so don't raise an alarming error status.
+      console.warn(
+        `[osync] skipping upsert for ${path}: file no longer readable (likely removed)`,
+        error,
+      );
+      return;
+    }
+    const changed = await this.deps.eventRecorder.recordUpsert(path, bytes, file.stat);
     this.notifyLocalChangeIfNeeded(changed);
   }
 

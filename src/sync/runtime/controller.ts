@@ -130,6 +130,14 @@ export class SyncController {
     this.statusTracker.setStatus("not_ready");
   }
 
+  async countExcludedRemoteEntries(): Promise<number> {
+    return await this.syncEngine.countExcludedRemoteEntries();
+  }
+
+  async purgeExcludedRemoteEntries(): Promise<number> {
+    return await this.syncEngine.purgeExcludedRemoteEntries();
+  }
+
   pauseAutoSync(): void {
     this.syncEngine.pauseAutoSync();
   }
@@ -140,6 +148,9 @@ export class SyncController {
 
   async resetLocalSyncState(opts?: { preserveLocalVaultId?: boolean }): Promise<void> {
     this.syncEngine.stopAutoSync();
+    // Let any in-flight pull/push and queued local work settle before detaching and
+    // deleting the store, so nothing keeps writing to a store being torn down.
+    await this.syncEngine.drainInFlightSync();
     this.statusTracker.setStorageStatus(null);
     const store = this.syncEngine.detachStore();
     try {
@@ -289,6 +300,7 @@ export class SyncController {
     }
     try {
       this.syncEngine.stopAutoSync();
+      await this.syncEngine.drainInFlightSync();
       await this.syncEngine.wipeLocalEntriesForRestore();
       this.statusTracker.setStatus("syncing");
       await this.ensureAutoSyncState();

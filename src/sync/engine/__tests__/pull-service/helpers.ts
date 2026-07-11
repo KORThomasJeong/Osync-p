@@ -329,6 +329,7 @@ export function createEventGate(calls: string[][]): SyncEventGateLike {
     isSuppressed(): boolean {
       return false;
     },
+    noteSuppressedEvent(): void {},
     async suppressPaths(paths, action) {
       calls.push(paths.filter((path): path is string => typeof path === "string"));
       return await action();

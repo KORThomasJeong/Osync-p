@@ -2,6 +2,7 @@ import type { SyncTokenResponse } from "../remote/client";
 import type { SyncEventGateLike } from "./event-gate";
 import { SyncPullClient } from "../remote/pull-client";
 import type { SyncCryptoService } from "../core/crypto-service";
+import type { SyncFileRules } from "../core/file-rules";
 import type { SyncRealtimeSession } from "../remote/realtime-client";
 import type {
   SyncCursorStore,
@@ -35,6 +36,7 @@ export interface SyncPullServiceDeps {
   now?: () => number;
   isInitialDownloadSync?: () => Promise<boolean>;
   onInitialPullComplete?: () => Promise<void>;
+  getSyncFileRules?: () => SyncFileRules;
 }
 
 export interface SyncPullStore
@@ -69,6 +71,7 @@ export class SyncPullService {
       },
       onConflict: this.deps.onConflict,
       now: this.deps.now,
+      getSyncFileRules: this.deps.getSyncFileRules,
     });
   }
 

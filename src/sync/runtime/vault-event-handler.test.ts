@@ -99,6 +99,173 @@ describe("SyncVaultEventHandler", () => {
     expect(recordDelete).not.toHaveBeenCalled();
     expect(notifyLocalChange).not.toHaveBeenCalled();
   });
+
+  it("fires onDeleteBurst when many deletes arrive in a short window", async () => {
+    const callbacks: Partial<Record<"delete", VaultEventCallback>> = {};
+    const plugin = createPlugin(callbacks);
+    const onDeleteBurst = vi.fn();
+    const runLocalMutationWork = vi.fn(async (work: () => Promise<void>) => await work());
+    let clock = 1_000;
+    const handler = new SyncVaultEventHandler({
+      plugin,
+      vaultAdapter: {
+        asSyncableFile: () => null,
+        asSyncableFolder: () => null,
+        isSyncablePath: () => true,
+        readFile: async () => new Uint8Array(),
+      } as unknown as ObsidianSyncVaultAdapter,
+      eventRecorder: {
+        async recordUpsert() {
+          return true;
+        },
+        async recordDelete() {
+          return true;
+        },
+        async recordRename() {
+          return true;
+        },
+      } as unknown as Pick<SyncEventRecorder, "recordUpsert" | "recordRename" | "recordDelete">,
+      autoLoop: { notifyLocalChange: vi.fn() },
+      runLocalMutationWork,
+      hasActiveRemoteVaultSession: () => true,
+      onError: vi.fn(),
+      onDeleteBurst,
+      now: () => clock,
+      deleteBurst: { windowMs: 1000, threshold: 5 },
+    } as never);
+
+    handler.register();
+    for (let i = 0; i < 5; i += 1) {
+      callbacks.delete?.(createFile(`note-${i}.md`));
+      clock += 10;
+    }
+    await nextTask();
+
+    expect(onDeleteBurst).toHaveBeenCalled();
+  });
+
+  it("does not raise an error when a file vanishes before it can be read", async () => {
+    const callbacks: Partial<Record<"modify", VaultEventCallback>> = {};
+    const plugin = createPlugin(callbacks);
+    const onError = vi.fn();
+    const notifyLocalChange = vi.fn();
+    const settled: Array<Promise<void>> = [];
+    const runLocalMutationWork = vi.fn((work: () => Promise<void>) => {
+      const run = work();
+      settled.push(run.catch(() => undefined));
+      return run;
+    });
+    const recordUpsert = vi.fn(async () => true);
+    const handler = new SyncVaultEventHandler({
+      plugin,
+      vaultAdapter: {
+        asSyncableFile: (f: TAbstractFile) => f as TFile,
+        asSyncableFolder: () => null,
+        isSyncablePath: () => true,
+        // The file was created then deleted (atomic save / scratch file) before this
+        // deferred read runs — ENOENT.
+        readFile: async () => {
+          throw new Error("ENOENT: file not found");
+        },
+      } as unknown as ObsidianSyncVaultAdapter,
+      eventRecorder: {
+        recordUpsert,
+        async recordDelete() {
+          return true;
+        },
+        async recordRename() {
+          return true;
+        },
+      } as unknown as Pick<SyncEventRecorder, "recordUpsert" | "recordRename" | "recordDelete">,
+      autoLoop: { notifyLocalChange },
+      runLocalMutationWork,
+      hasActiveRemoteVaultSession: () => true,
+      onError,
+    });
+
+    handler.register();
+    callbacks.modify?.(createFile("note.md"));
+    await Promise.all(settled);
+
+    // A vanished file is benign: no error alarm, no upsert recorded.
+    expect(onError).not.toHaveBeenCalled();
+    expect(recordUpsert).not.toHaveBeenCalled();
+  });
+
+  it("replayPath re-records an existing file as an upsert", async () => {
+    const runLocalMutationWork = vi.fn(async (work: () => Promise<void>) => await work());
+    const recordUpsert = vi.fn(async () => true);
+    const recordDelete = vi.fn(async () => true);
+    const file = createFile("Notes/a.md");
+    const plugin = {
+      registerEvent: vi.fn(),
+      app: { vault: { on: vi.fn(() => ({})), getAbstractFileByPath: () => file } },
+    } as unknown as Plugin;
+
+    const handler = new SyncVaultEventHandler({
+      plugin,
+      vaultAdapter: {
+        asSyncableFile: (f: TAbstractFile) => f as TFile,
+        asSyncableFolder: () => null,
+        isSyncablePath: () => true,
+        readFile: async () => new TextEncoder().encode("body"),
+      } as unknown as ObsidianSyncVaultAdapter,
+      eventRecorder: {
+        recordUpsert,
+        recordDelete,
+        async recordRename() {
+          return true;
+        },
+      } as unknown as Pick<SyncEventRecorder, "recordUpsert" | "recordRename" | "recordDelete">,
+      autoLoop: { notifyLocalChange: vi.fn() },
+      runLocalMutationWork,
+      hasActiveRemoteVaultSession: () => true,
+      onError: vi.fn(),
+    });
+
+    handler.replayPath("Notes/a.md");
+    await nextTask();
+
+    expect(recordUpsert).toHaveBeenCalledTimes(1);
+    expect(recordDelete).not.toHaveBeenCalled();
+  });
+
+  it("replayPath records a delete when the path no longer exists on disk", async () => {
+    const runLocalMutationWork = vi.fn(async (work: () => Promise<void>) => await work());
+    const recordUpsert = vi.fn(async () => true);
+    const recordDelete = vi.fn(async () => true);
+    const plugin = {
+      registerEvent: vi.fn(),
+      app: { vault: { on: vi.fn(() => ({})), getAbstractFileByPath: () => null } },
+    } as unknown as Plugin;
+
+    const handler = new SyncVaultEventHandler({
+      plugin,
+      vaultAdapter: {
+        asSyncableFile: () => null,
+        asSyncableFolder: () => null,
+        isSyncablePath: () => true,
+        readFile: async () => new Uint8Array(),
+      } as unknown as ObsidianSyncVaultAdapter,
+      eventRecorder: {
+        recordUpsert,
+        recordDelete,
+        async recordRename() {
+          return true;
+        },
+      } as unknown as Pick<SyncEventRecorder, "recordUpsert" | "recordRename" | "recordDelete">,
+      autoLoop: { notifyLocalChange: vi.fn() },
+      runLocalMutationWork,
+      hasActiveRemoteVaultSession: () => true,
+      onError: vi.fn(),
+    });
+
+    handler.replayPath("Notes/gone.md");
+    await nextTask();
+
+    expect(recordDelete).toHaveBeenCalledTimes(1);
+    expect(recordUpsert).not.toHaveBeenCalled();
+  });
 });
 
 function createPlugin(

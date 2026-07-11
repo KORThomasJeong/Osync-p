@@ -23,7 +23,7 @@ import { isAutoMergeTextPath } from "./text-merge-policy";
 export interface SyncEventRecorderDeps {
   getSyncStore: () => SyncEventRecorderStore | null;
   crypto: SyncCryptoService;
-  eventGate?: Pick<SyncEventGateLike, "isSuppressed">;
+  eventGate?: Pick<SyncEventGateLike, "isSuppressed" | "noteSuppressedEvent">;
 }
 
 export interface SyncEventRecorderStore
@@ -59,6 +59,7 @@ export class SyncEventRecorder {
     localStat: LocalFileStat | null = null,
   ): Promise<boolean> {
     if (this.isSuppressed(path)) {
+      this.noteSuppressed(path);
       return false;
     }
 
@@ -122,6 +123,8 @@ export class SyncEventRecorder {
     localStat: LocalFileStat | null = null,
   ): Promise<boolean> {
     if (this.isSuppressed(oldPath) || this.isSuppressed(nextPath)) {
+      this.noteSuppressed(oldPath);
+      this.noteSuppressed(nextPath);
       return false;
     }
 
@@ -180,6 +183,7 @@ export class SyncEventRecorder {
 
   async recordDelete(path: string): Promise<boolean> {
     if (this.isSuppressed(path)) {
+      this.noteSuppressed(path);
       return false;
     }
 
@@ -298,6 +302,13 @@ export class SyncEventRecorder {
 
   private isSuppressed(path: string): boolean {
     return this.deps.eventGate?.isSuppressed(path) ?? false;
+  }
+
+  // Record that a real vault event was dropped because its path was suppressed, so the
+  // gate can replay it once the suppression window closes (avoids losing a user edit
+  // that landed during a pull's write).
+  private noteSuppressed(path: string): void {
+    this.deps.eventGate?.noteSuppressedEvent(path);
   }
 
   private requireStore(): SyncEventRecorderStore {

@@ -18,6 +18,7 @@ export interface OsyncCommandController {
   isSyncPaused(): boolean;
   toggleSyncPause(): Promise<void>;
   resetLocalSyncStateInPlace(): Promise<void>;
+  purgeExcludedFoldersFromServer(): Promise<void>;
   listConflictCopies(): Promise<OsyncConflictCopy[]>;
   deleteConflictCopies(
     paths: string[],
@@ -127,6 +128,20 @@ export function registerOsyncCommands(
           listConflictCopies: () => controller.listConflictCopies(),
           deleteConflictCopies: (paths, onProgress) => controller.deleteConflictCopies(paths, onProgress),
         }).open();
+      }
+      return true;
+    },
+  });
+
+  plugin.addCommand({
+    id: "purge-excluded-folders-from-server",
+    name: "Purge excluded folders from server",
+    checkCallback: (checking) => {
+      if (!controller.hasConnectedRemoteVault()) {
+        return false;
+      }
+      if (!checking) {
+        void controller.purgeExcludedFoldersFromServer();
       }
       return true;
     },

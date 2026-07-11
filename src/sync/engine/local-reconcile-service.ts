@@ -24,6 +24,7 @@ import {
   shouldTripMassDeleteGuard,
 } from "./mass-delete-guard";
 import { isAutoMergeTextPath } from "./text-merge-policy";
+import { toPathKey } from "../store/dexie/path-key";
 
 export interface LocalSyncFile {
   path: string;
@@ -81,21 +82,26 @@ export class SyncLocalReconcileService {
   }): Promise<ReconcileOnceResult> {
     const store = this.requireStore();
     const localFiles = await this.deps.scanner.listFiles();
-    const localPaths = new Set(localFiles.map((file) => file.path));
+    // Membership is keyed by NFC path key: macOS scans return NFD while stored paths are
+    // NFC, so a raw string compare treats the same file as missing and queues a ghost
+    // delete. Keys normalize both sides; the original paths are still used for I/O.
+    const localPathKeys = new Set(localFiles.map((file) => toPathKey(file.path)));
     const knownEntries = await this.filterKnownEntries(store);
 
     if (!options?.allowMassDelete) {
-      const localFolderPaths = new Set(this.deps.scanner.listFolders());
+      const localFolderPathKeys = new Set(
+        this.deps.scanner.listFolders().map((path) => toPathKey(path)),
+      );
       let deleteCandidates = 0;
       for (const entry of knownEntries) {
         if (entry.deleted || !entry.path) {
           continue;
         }
         if (entry.entryType === "folder") {
-          if (!localFolderPaths.has(entry.path)) {
+          if (!localFolderPathKeys.has(toPathKey(entry.path))) {
             deleteCandidates += 1;
           }
-        } else if (!localPaths.has(entry.path)) {
+        } else if (!localPathKeys.has(toPathKey(entry.path))) {
           deleteCandidates += 1;
         }
       }
@@ -141,7 +147,12 @@ export class SyncLocalReconcileService {
     let filesQueuedForDelete = 0;
 
     for (const entry of knownEntries) {
-      if (entry.deleted || !entry.path || localPaths.has(entry.path) || !entry.hash) {
+      if (
+        entry.deleted ||
+        !entry.path ||
+        localPathKeys.has(toPathKey(entry.path)) ||
+        !entry.hash
+      ) {
         continue;
       }
 
@@ -214,7 +225,7 @@ export class SyncLocalReconcileService {
       if (
         entry.deleted ||
         !entry.path ||
-        localPaths.has(entry.path) ||
+        localPathKeys.has(toPathKey(entry.path)) ||
         reusedEntryIds.has(entry.entryId) ||
         entry.entryType === "folder"
       ) {
@@ -251,15 +262,19 @@ export class SyncLocalReconcileService {
 
     await store.flush();
 
-    // Folder reconcile phase
-    const localFolderPaths = new Set(this.deps.scanner.listFolders());
+    // Folder reconcile phase. Iterate the original scanned paths (needed for real I/O and
+    // mutation payloads) but decide membership on NFC path keys, like the file phase above.
+    const localFolderPaths = this.deps.scanner.listFolders();
+    const localFolderPathKeys = new Set(localFolderPaths.map((path) => toPathKey(path)));
     const knownFolderEntries = knownEntries.filter((e) => e.entryType === "folder");
-    const knownFolderPaths = new Set(
-      knownFolderEntries.filter((e) => !e.deleted && e.path).map((e) => e.path as string),
+    const knownFolderPathKeys = new Set(
+      knownFolderEntries
+        .filter((e) => !e.deleted && e.path)
+        .map((e) => toPathKey(e.path as string)),
     );
 
     for (const folderPath of localFolderPaths) {
-      if (!knownFolderPaths.has(folderPath)) {
+      if (!knownFolderPathKeys.has(toPathKey(folderPath))) {
         const existing = await store.getLocalStateByPath(folderPath);
         const remote = existing ? await store.getRemoteStateById(existing.entryId) : null;
         const entryId =
@@ -287,7 +302,7 @@ export class SyncLocalReconcileService {
     }
 
     for (const entry of knownFolderEntries) {
-      if (entry.deleted || !entry.path || localFolderPaths.has(entry.path)) {
+      if (entry.deleted || !entry.path || localFolderPathKeys.has(toPathKey(entry.path))) {
         continue;
       }
       const remote = await store.getRemoteStateById(entry.entryId);

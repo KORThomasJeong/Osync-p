@@ -257,6 +257,80 @@ describe("SyncEngine", () => {
       await store.close();
     });
   });
+
+  describe("drainInFlightSync", () => {
+    it("waits for an in-flight pull to finish before resolving", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8("body"));
+      const engine = createEngine(plugin);
+      const activityEngine = engine as unknown as {
+        withSyncActivity<T>(kind: "pull", work: () => Promise<T>): Promise<T>;
+        drainInFlightSync(): Promise<void>;
+      };
+
+      let releasePull: () => void = () => {};
+      const pullGate = new Promise<void>((resolve) => {
+        releasePull = resolve;
+      });
+      const pull = activityEngine.withSyncActivity("pull", async () => {
+        await pullGate;
+      });
+
+      let drained = false;
+      const drain = activityEngine.drainInFlightSync().then(() => {
+        drained = true;
+      });
+
+      await nextTask();
+      expect(drained).toBe(false); // pull still running → drain must wait
+
+      releasePull();
+      await pull;
+      await drain;
+      expect(drained).toBe(true);
+    });
+  });
+
+  describe("purgeExcludedRemoteEntries", () => {
+    it("queues delete mutations for live remote entries in excluded folders, leaving others", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8("body"));
+      const store = await createInitializedTestSyncStore(plugin);
+      await store.applyRemoteState({
+        entryId: "keep",
+        path: "Notes/keep.md",
+        revision: 1,
+        blobId: "b-keep",
+        hash: "h-keep",
+        deleted: false,
+        updatedAt: 1,
+      });
+      await store.applyRemoteState({
+        entryId: "zombie",
+        path: "Wiki/_retrieval/doc.md",
+        revision: 1,
+        blobId: "b-zombie",
+        hash: "h-zombie",
+        deleted: false,
+        updatedAt: 1,
+      });
+
+      const engine = createEngine(plugin, {
+        getSyncFileRules: () => ({
+          ...DEFAULT_SYNC_FILE_RULES,
+          excludedFolders: ["Wiki/_retrieval"],
+        }),
+      });
+      engine.setStore(store);
+
+      const purged = await engine.purgeExcludedRemoteEntries();
+      expect(purged).toBe(1);
+
+      const dirty = await store.listDirtyEntries(10);
+      expect(dirty.map((m) => m.entryId)).toEqual(["zombie"]);
+      expect(dirty[0]?.op).toBe("delete");
+
+      await store.close();
+    });
+  });
 });
 
 function createEngine(

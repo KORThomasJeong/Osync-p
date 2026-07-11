@@ -7,7 +7,6 @@ import type { SyncTokenResponse } from "../remote/client";
 import {
   type CommitAcceptedResult,
   type CommitMutationBatchResult,
-  SyncRealtimeError,
   type SyncRealtimeSession,
 } from "../remote/realtime-client";
 import type { PendingMutationRow } from "../store/store";
@@ -309,10 +308,24 @@ export class PushMutationCommitter {
       };
     }
 
+    // An unclassified rejection (e.g. a new/unknown server code) must not abort the whole
+    // drain and retry the same doomed batch forever. Block just this mutation so the rest
+    // of the batch proceeds; the blocked entry is surfaced and no longer a live dirty row.
     console.error(
-      `[osync] commit rejected entryId=${mutation.entryId} op=${mutation.op} baseRevision=${mutation.baseRevision} code=${rejected.code} message=${rejected.message}`,
+      `[osync] commit rejected (blocking) entryId=${mutation.entryId} op=${mutation.op} baseRevision=${mutation.baseRevision} code=${rejected.code} message=${rejected.message}`,
     );
-    throw new SyncRealtimeError(rejected.code, rejected.message);
+    await store.updateDirtyEntry({
+      ...mutation,
+      status: "blocked",
+      blockedReason: "unresolved_rejection",
+    });
+    return {
+      status: "requeued",
+      filesCreatedOrUpdated: 0,
+      filesDeleted: 0,
+      conflictsCreated: 0,
+      shouldPullAfterPush: false,
+    };
   }
 
   private async applyAcceptedMutation(

@@ -23,6 +23,7 @@ import {
   describePathLimit,
   isPathWithinSyncLimits,
 } from "../core/path-limits";
+import { shouldSyncPath, type SyncFileRules } from "../core/file-rules";
 import type { SyncEventGateLike } from "./event-gate";
 import { PullBlobPreparer } from "./pull-blob-preparer";
 import { PullManifestPlanner, type PullManifestStore } from "./pull-manifest-planner";
@@ -58,6 +59,14 @@ export interface PullEntryStateApplierDeps {
   onProgress?: (progress: SyncProgressCounts) => Promise<void>;
   onConflict?: (event: PullConflictEvent) => void;
   now?: () => number;
+  // Notified (best-effort) when a remote entry could not be decrypted and was
+  // quarantined, so callers can surface a diagnostic. Never throws the pull.
+  onDecryptFailure?: (entryId: string) => void;
+  // When provided, remote entries whose path is not syncable on this device
+  // (e.g. inside an excluded folder) are recorded in the store but never written
+  // to or deleted from disk — so they stop churning the vault while still
+  // advancing the cursor. Omit to treat every path as syncable (legacy behavior).
+  getSyncFileRules?: () => SyncFileRules;
 }
 
 export interface PullEntryStateApplyResult {
@@ -114,13 +123,23 @@ export class PullEntryStateApplier {
     this.pendingMutations = new PullPendingMutationHandler(deps);
   }
 
+  // A remote path that this device's file rules exclude (e.g. an excluded folder)
+  // must not touch the disk on pull. The remote state is still recorded so the
+  // cursor advances and the entry is not re-downloaded on every subsequent pull.
+  private isDiskWritablePath(path: string | null | undefined): boolean {
+    if (!path) return false;
+    const getRules = this.deps.getSyncFileRules;
+    if (!getRules) return true;
+    return shouldSyncPath(path, getRules());
+  }
+
   async createManifestItems(
     states: RemoteEntryState[],
   ): Promise<PullEntryStateManifestItem[]> {
-    return await mapWithConcurrency(
+    const items = await mapWithConcurrency(
       states,
       this.deps.prepareConcurrency ?? DEFAULT_PREPARE_CONCURRENCY,
-      async (state) => {
+      async (state): Promise<PullEntryStateManifestItem | null> => {
         try {
           return {
             state,
@@ -130,15 +149,20 @@ export class PullEntryStateApplier {
             ),
           };
         } catch (error) {
+          // One undecryptable entry (key rotation, corrupt ciphertext, a poisoned row)
+          // must not abort the whole page — that would stall the pull at this cursor and
+          // re-fail forever. Quarantine it and keep applying the healthy entries.
           const ctx = metadataContextFromRemoteState(state);
           console.error(
-            `[osync] pull: failed to decrypt remote entry ${ctx.entryId} rev=${ctx.revision} op=${ctx.op} blobId=${ctx.blobId ?? "null"}`,
+            `[osync] pull: quarantining undecryptable remote entry ${ctx.entryId} rev=${ctx.revision} op=${ctx.op} blobId=${ctx.blobId ?? "null"}`,
             error,
           );
-          throw error;
+          this.deps.onDecryptFailure?.(ctx.entryId);
+          return null;
         }
       },
     );
+    return items.filter((item): item is PullEntryStateManifestItem => item !== null);
   }
 
   async applyEntryStates(
@@ -328,6 +352,8 @@ export class PullEntryStateApplier {
             let removed = 0;
             if (!skipDeletions) {
               for (const path of batch.pathsToRemove) {
+                // Never touch the disk for paths excluded on this device.
+                if (!this.isDiskWritablePath(path)) continue;
                 if (await removeVaultPathIfExists(this.deps.vaultAdapter, path)) {
                   removed += 1;
                 }
@@ -337,6 +363,7 @@ export class PullEntryStateApplier {
             const writablePlans = batch.blobs.filter(({ plan }) => {
               if (!plan.finalPath) return false;
               if (skipRemoteWritePlans.has(plan)) return false;
+              if (!this.isDiskWritablePath(plan.finalPath)) return false;
               if (!isPathWithinSyncLimits(plan.finalPath)) {
                 const detail = describePathLimit(plan.finalPath);
                 console.warn(
@@ -425,15 +452,17 @@ export class PullEntryStateApplier {
 
             if (plan.state.deleted) {
               const deletePath = plan.existing?.path ?? plan.metadata.path;
-              if (deletePath) {
+              if (deletePath && this.isDiskWritablePath(deletePath)) {
                 foldersToDelete.push(deletePath);
               }
             } else if (plan.finalPath) {
-              if (!(await this.deps.vaultAdapter.exists(plan.finalPath))) {
-                await this.deps.vaultAdapter.mkdir(plan.finalPath);
+              if (this.isDiskWritablePath(plan.finalPath)) {
+                if (!(await this.deps.vaultAdapter.exists(plan.finalPath))) {
+                  await this.deps.vaultAdapter.mkdir(plan.finalPath);
+                }
               }
               const oldPath = plan.existing?.path;
-              if (oldPath && oldPath !== plan.finalPath) {
+              if (oldPath && oldPath !== plan.finalPath && this.isDiskWritablePath(oldPath)) {
                 foldersToDelete.push(oldPath);
               }
             }

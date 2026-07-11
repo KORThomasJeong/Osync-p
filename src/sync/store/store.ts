@@ -67,7 +67,8 @@ export type SyncBlobRole = "base" | "remote" | "local-cache";
 
 export type PendingMutationBlockedReason =
   | "file_too_large"
-  | "storage_quota_exceeded";
+  | "storage_quota_exceeded"
+  | "unresolved_rejection";
 
 export interface PendingMutationRow {
   mutationId: string;

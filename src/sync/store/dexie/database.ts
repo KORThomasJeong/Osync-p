@@ -184,17 +184,28 @@ export interface OrphanCleanupResult {
 
 export async function cleanupOrphanSyncStores(
   currentLocalVaultId: string,
+  ownedLocalVaultIds: readonly string[],
   lister: IndexedDbLister = defaultIndexedDbLister,
 ): Promise<OrphanCleanupResult> {
   const currentName = syncStoreDbName(currentLocalVaultId);
   const deleted: string[] = [];
   const failed: string[] = [];
 
+  // On Obsidian desktop every open vault shares one IndexedDB origin, so the
+  // orphan list contains other vaults' sync stores. Only ever delete stores this
+  // vault has previously owned — never a store belonging to another vault.
+  const deletableNames = new Set(
+    ownedLocalVaultIds
+      .map((id) => syncStoreDbName(id))
+      .filter((name) => name !== currentName),
+  );
+
   const databases = await lister.listDatabases();
   for (const db of databases) {
     const name = db.name;
     if (!name || !name.startsWith(SYNC_STORE_DB_PREFIX)) continue;
     if (name === currentName) continue;
+    if (!deletableNames.has(name)) continue;
 
     try {
       await lister.deleteDatabase(name);

@@ -7,6 +7,7 @@ import { OsyncPluginDataStore } from "../plugin-data";
 import type { OsyncSettingsController } from "../settings/controller";
 import { OsyncSettingsStore } from "../settings/store";
 import { MassDeleteGuardModal } from "./mass-delete-guard-modal";
+import { openPurgeExcludedConfirmModal } from "./purge-excluded-modal";
 import { OSYNC_CONFLICT_VIEW_TYPE } from "./conflict-resolution-view";
 import { OsyncRemoteVaultController } from "./remote-vault-controller";
 import { OsyncVersionHistoryController } from "./version-history-controller";
@@ -203,6 +204,26 @@ export class OsyncPluginController implements OsyncSettingsController {
       this.syncController.resumeAutoSyncFromPause();
     }
     this.deps.refreshUi();
+  }
+
+  // Remove server-side entries that live in this device's excluded folders (zombies whose
+  // local delete never propagated). Shows a dry-run count and requires confirmation before
+  // queueing the deletes, then pushes them so the server tombstones them.
+  async purgeExcludedFoldersFromServer(): Promise<void> {
+    try {
+      const count = await this.syncController.countExcludedRemoteEntries();
+      if (count === 0) {
+        new Notice("Osync: No excluded-folder entries on the server to purge.");
+        return;
+      }
+      const confirmed = await openPurgeExcludedConfirmModal(this.plugin.app, count);
+      if (!confirmed) return;
+      const purged = await this.syncController.purgeExcludedRemoteEntries();
+      await this.ensureAutoSyncState();
+      new Notice(`Osync: Queued ${purged} excluded entr${purged === 1 ? "y" : "ies"} for deletion on the server.`);
+    } catch (error) {
+      this.notifyError(error, "Purge excluded folders failed");
+    }
   }
 
   ensureAutoSyncState(): Promise<void> {

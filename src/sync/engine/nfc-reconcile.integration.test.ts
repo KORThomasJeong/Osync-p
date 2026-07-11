@@ -163,4 +163,50 @@ describe("NFC reconcile integration (macOS NFD/NFC)", () => {
 
     await store.close();
   });
+
+  it("does not queue a ghost delete when a synced entry's NFC localPath is rescanned as NFD", async () => {
+    // A fully-synced file whose stored localPath is composed (NFC) — as the pull applier
+    // writes it. macOS then rescans the very same file decomposed (NFD). The reconcile
+    // delete loop compares the scan set against each entry's path; a raw comparison sees the
+    // NFC entry as "missing from disk" and queues a delete for a file that is right there,
+    // tombstoning it on the server and churning it back on the next pull.
+    const hash = await hashBytes(BODY);
+    const store = await createDexieSyncStore(createTestPlugin());
+    const corruption = collectCorruption(store);
+
+    await store.upsertEntry({
+      entryId: "entry-synced",
+      path: NFC_PATH,
+      revision: 3,
+      blobId: "blob-1",
+      hash,
+      deleted: false,
+      updatedAt: 100,
+      localMtime: 10,
+      localSize: BODY.byteLength,
+    });
+    await putTestBaseBlob(store, { blobId: "blob-1", hash, bytes: BODY });
+
+    const service = new SyncLocalReconcileService({
+      getSyncStore: () => store,
+      crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+      shouldSyncPath: () => true,
+      scanner: {
+        async listFiles() {
+          return [localFile(NFD_PATH, BODY)];
+        },
+        listFolders: () => [],
+      },
+    });
+
+    const result = await service.reconcileOnce();
+
+    // The NFD scan matches the NFC entry — no ghost delete.
+    expect(result.filesQueuedForDelete).toBe(0);
+    const local = await store.getLocalStateById("entry-synced");
+    expect(local?.deleted).toBe(false);
+    expect(corruption).toEqual([]);
+
+    await store.close();
+  });
 });

@@ -84,7 +84,6 @@ export class SyncPushService {
       throw new Error("Sync store is not initialized.");
     }
 
-    const token = await this.deps.getSyncToken();
     const initialDirty = await store.listDirtyEntries(1000);
     console.log(`[osync] push start dirty=${initialDirty.length}`);
     let cursor = await store.getCursor();
@@ -116,6 +115,11 @@ export class SyncPushService {
           break;
         }
 
+        // Re-fetch the token every batch. A long burst (thousands of files) can
+        // outlive the ~120s token TTL; the token manager returns the cached token
+        // until it nears expiry, then transparently re-issues, so blob uploads in
+        // later batches never fail with 401. (P0-C)
+        const token = await this.deps.getSyncToken();
         const preparedMutations = await this.preparePendingMutations(
           store,
           token,

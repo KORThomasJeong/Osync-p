@@ -11,7 +11,7 @@ import {
   SyncLocalReconcileService,
 } from "../engine/local-reconcile-service";
 import { ObsidianSyncVaultAdapter } from "../vault/obsidian-vault-adapter";
-import { classifyReconnectError } from "../remote/reconnect-error";
+import { SyncErrorEscalator } from "./sync-error-escalator";
 import { SyncPullService } from "../engine/pull-service";
 import { SyncPushService } from "../engine/push-service";
 import { SyncHttpClient } from "../remote/http-client";
@@ -28,6 +28,9 @@ import {
 import type { DeletedSyncEntryRow, SyncStore } from "../store/store";
 import type { SyncStoreCorruptionListener } from "../store/ports";
 import { cleanupOrphanSyncStores } from "../store/dexie/database";
+import { readOwnedLocalVaultIds } from "../store/dexie/local-vault";
+import { findExcludedRemoteEntries } from "../engine/purge-excluded";
+import { queueLocalDeleteMutation } from "../core/mutation-queue";
 import {
   getOrCreateStoredLocalVaultId,
   readStoredSyncConnection,
@@ -46,6 +49,8 @@ type SyncActivityKind = "push" | "pull" | "local";
 interface ActiveSyncActivity {
   id: number;
   kind: SyncActivityKind;
+  done: Promise<void>;
+  settle: () => void;
 }
 
 export interface SyncEngineDeps {
@@ -78,11 +83,14 @@ export class SyncEngine {
   private syncStore: SyncStore | null = null;
   private corruptionListener: SyncStoreCorruptionListener | null = null;
   private actionableAttention = false;
+  private readonly syncErrorEscalator = new SyncErrorEscalator();
   private lastActionableMessage: string | null = null;
   private localMutationQueue: Promise<void> = Promise.resolve();
   private activeSyncActivities: ActiveSyncActivity[] = [];
   private nextSyncActivityId = 1;
-  private readonly syncEventGate = new SyncEventGate();
+  private readonly syncEventGate = new SyncEventGate((path) =>
+    this.syncVaultEventHandler.replayPath(path),
+  );
   private readonly vaultAdapter = new ObsidianSyncVaultAdapter(
     this.deps.plugin,
     () => this.deps.getSyncFileRules(),
@@ -154,17 +162,18 @@ export class SyncEngine {
       this.deps.setSyncStatus("up_to_date");
     },
     onError: (error) => {
-      const classification = classifyReconnectError(error);
-      if (classification.kind === "transient") {
-        // Transient network failures are expected during roaming / backgrounding.
-        // Stay "reconnecting" and keep retrying without alarming the user.
-        console.error("[osync] transient sync error", error);
+      const decision = this.syncErrorEscalator.recordError(error);
+      if (!decision.escalate) {
+        // Below the repeat threshold: likely a transient network blip. Keep retrying
+        // quietly, but log so a persistent failure leaves a trail before it escalates.
+        console.error("[osync] sync error (retrying)", error);
         return;
       }
 
+      console.error("[osync] sync error (escalated)", error);
       this.actionableAttention = true;
       this.deps.setSyncStatus("attention_needed");
-      const message = classification.userMessage ?? "Auto sync failed";
+      const message = decision.message;
       if (message !== this.lastActionableMessage) {
         this.lastActionableMessage = message;
         this.deps.notify(message);
@@ -182,6 +191,15 @@ export class SyncEngine {
       this.deps.setSyncStatus("attention_needed");
       this.deps.notifyError(error, "Sync event handling failed");
     },
+    onDeleteBurst: () => {
+      // Many files deleted at once while Obsidian is open (script/tool). Pause pushing
+      // those deletions and alert so the user can restore from server if unintended.
+      this.syncAutoLoop.pause();
+      this.deps.setSyncStatus("attention_needed");
+      this.deps.notify(
+        "Osync: 대량 삭제가 감지되어 동기화를 일시정지했습니다. 의도한 삭제면 동기화를 재개하고, 아니면 서버에서 복원하세요.",
+      );
+    },
   });
   private readonly syncPullClient = new SyncPullClient(this.syncHttpClient);
   private readonly syncPullService = new SyncPullService({
@@ -192,6 +210,7 @@ export class SyncEngine {
     eventGate: this.syncEventGate,
     vaultAdapter: this.vaultAdapter,
     pullClient: this.syncPullClient,
+    getSyncFileRules: () => this.deps.getSyncFileRules(),
     onProgress: async (progress) => {
       this.reportActivityProgress(progress);
     },
@@ -235,7 +254,8 @@ export class SyncEngine {
       .readLocalVaultId()
       .then(async (localVaultId) => {
         if (!localVaultId) return;
-        const result = await cleanupOrphanSyncStores(localVaultId);
+        const owned = readOwnedLocalVaultIds(this.deps.plugin);
+        const result = await cleanupOrphanSyncStores(localVaultId, owned);
         if (result.deleted.length > 0) {
           console.info(
             `[osync:orphan-cleanup] removed ${result.deleted.length} orphan sync store(s)`,
@@ -567,9 +587,15 @@ export class SyncEngine {
   }
 
   private beginSyncActivity(kind: SyncActivityKind): ActiveSyncActivity {
-    const activity = {
+    let settle: () => void = () => {};
+    const done = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const activity: ActiveSyncActivity = {
       id: this.nextSyncActivityId,
       kind,
+      done,
+      settle,
     };
     this.nextSyncActivityId += 1;
     this.activeSyncActivities.push(activity);
@@ -580,7 +606,67 @@ export class SyncEngine {
     this.activeSyncActivities = this.activeSyncActivities.filter(
       (activeActivity) => activeActivity.id !== activity.id,
     );
+    activity.settle();
     await this.refreshSyncProgress();
+  }
+
+  // Count the server-side zombie entries a purge would remove (for a dry-run preview).
+  async countExcludedRemoteEntries(): Promise<number> {
+    const store = this.requireStore();
+    return findExcludedRemoteEntries(
+      await store.listRemoteStates(),
+      this.deps.getSyncFileRules(),
+    ).length;
+  }
+
+  // Queue delete mutations for live remote entries whose path this device's rules exclude
+  // (folders the event handler never propagated a local delete for). The next push
+  // tombstones them on the server, ending the re-download churn. Returns how many.
+  async purgeExcludedRemoteEntries(): Promise<number> {
+    const store = this.requireStore();
+    const targets = findExcludedRemoteEntries(
+      await store.listRemoteStates(),
+      this.deps.getSyncFileRules(),
+    );
+    for (const target of targets) {
+      await this.runLocalMutationWork(async () => {
+        await queueLocalDeleteMutation(store, {
+          crypto: this.deps.crypto,
+          entryId: target.entryId,
+          base: target,
+          path: target.path as string,
+          entryType: target.entryType,
+          editedAt: Date.now(),
+        });
+        await store.applyLocalState({
+          entryId: target.entryId,
+          path: null,
+          blobId: null,
+          hash: null,
+          entryType: target.entryType,
+          deleted: true,
+          updatedAt: Date.now(),
+          localMtime: null,
+          localSize: null,
+        });
+      });
+    }
+    await store.flush();
+    if (targets.length > 0) {
+      this.syncAutoLoop.notifyLocalChange();
+    }
+    return targets.length;
+  }
+
+  // Wait for any in-flight pull/push and queued local work to settle. Callers that are
+  // about to detach/close/delete the store (reset, restore) must await this first, or an
+  // in-flight pullOnce keeps writing to a store being torn down underneath it.
+  async drainInFlightSync(): Promise<void> {
+    await this.waitForLocalMutationWork();
+    const pending = this.activeSyncActivities
+      .filter((activity) => activity.kind !== "local")
+      .map((activity) => activity.done);
+    await Promise.allSettled(pending);
   }
 
   private reportActivityProgress(progress: UserVisibleSyncProgress): void {
@@ -604,6 +690,7 @@ export class SyncEngine {
   private clearActionableAttention(): void {
     this.actionableAttention = false;
     this.lastActionableMessage = null;
+    this.syncErrorEscalator.recordSuccess();
   }
 
   private requireStore(): SyncStore {
