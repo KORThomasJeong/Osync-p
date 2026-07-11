@@ -247,21 +247,33 @@ export class PullEntryStateApplier {
     manifest: PullEntryStateManifestItem[],
     options: { deferExternalPathOwners: boolean },
   ): Promise<PreparedManifestApplication> {
-    const { plans, deferred } = await this.manifestPlanner.planManifest(
+    const { plans: plannedEntries, deferred } = await this.manifestPlanner.planManifest(
       store,
       manifest,
       options,
     );
+    const preparedBlobs = await this.blobPreparer.preparePathBatchBlobs(
+      store,
+      token,
+      plannedEntries,
+    );
+    const blobByPlan = new Map(preparedBlobs.map((blob) => [blob.plan, blob]));
+
+    // A plan whose blob was quarantined (permanent download-verification failure)
+    // has no prepared blob. Drop it so it is neither written to disk nor recorded
+    // in the store — the healthy entries still apply and the cursor advances past
+    // the poison entry instead of re-downloading the whole batch forever.
+    const plans = plannedEntries.filter((plan) => {
+      const needsBlob =
+        !!plan.finalPath &&
+        !plan.state.deleted &&
+        plan.state.entryType !== "folder";
+      return !needsBlob || blobByPlan.has(plan);
+    });
     const pathsToWrite = uniqueSyncPaths(plans.map((plan) => plan.finalPath));
     const pendingConflicts: PreparedPendingConflict[] = [];
     const preparedPendingMutationIds = new Set<string>();
     const batches: PreparedPathBatch[] = [];
-    const preparedBlobs = await this.blobPreparer.preparePathBatchBlobs(
-      store,
-      token,
-      plans,
-    );
-    const blobByPlan = new Map(preparedBlobs.map((blob) => [blob.plan, blob]));
 
     for (const plan of plans) {
       if (plan.adoptedLocalEntry?.hashMatches) {

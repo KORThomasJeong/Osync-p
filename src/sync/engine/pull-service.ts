@@ -33,6 +33,10 @@ export interface SyncPullServiceDeps {
   applyWindowSize?: number;
   onProgress: (progress: SyncProgressCounts) => Promise<void>;
   onConflict?: (event: PullConflictEvent) => void;
+  // Notified (best-effort) when a remote entry is quarantined because it can
+  // never be applied — undecryptable metadata, or a blob that fails decryption
+  // or content-hash verification. Lets callers surface a diagnostic.
+  onDecryptFailure?: (entryId: string) => void;
   now?: () => number;
   isInitialDownloadSync?: () => Promise<boolean>;
   onInitialPullComplete?: () => Promise<void>;
@@ -70,6 +74,7 @@ export class SyncPullService {
         await this.deps.onProgress(progress);
       },
       onConflict: this.deps.onConflict,
+      onDecryptFailure: this.deps.onDecryptFailure,
       now: this.deps.now,
       getSyncFileRules: this.deps.getSyncFileRules,
     });

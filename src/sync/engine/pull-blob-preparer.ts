@@ -18,6 +18,30 @@ interface PullBlobPreparerDeps {
   crypto: SyncCryptoService;
   pullClient: Pick<SyncPullClient, "downloadBlob">;
   prepareConcurrency?: number;
+  // Notified (best-effort) when a blob was downloaded but permanently failed
+  // verification (undecryptable ciphertext or content-hash mismatch) and was
+  // quarantined. Never throws the pull.
+  onDecryptFailure?: (entryId: string) => void;
+}
+
+/**
+ * A blob that downloaded successfully (HTTP 200) but failed verification in a
+ * way that is deterministic and permanent — the ciphertext will not decrypt, or
+ * the decrypted content does not match the metadata hash. Retrying re-downloads
+ * the identical bytes and fails identically, so a plain throw here would stall
+ * the pull at this cursor and re-download the whole batch forever. These are
+ * quarantined (skipped) instead. Transient failures (missing blob, network,
+ * 5xx) are NOT this error — they still propagate so the window rolls back and
+ * retries, which can succeed later.
+ */
+export class BlobVerificationError extends Error {
+  constructor(
+    readonly entryId: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BlobVerificationError";
+  }
 }
 
 export class PullBlobPreparer {
@@ -35,15 +59,31 @@ export class PullBlobPreparer {
         plan.state.entryType !== "folder",
     );
 
-    return await mapWithConcurrency(
+    const prepared = await mapWithConcurrency(
       blobPlans,
       this.deps.prepareConcurrency ?? DEFAULT_PREPARE_CONCURRENCY,
-      async (plan) => {
-        return {
-          plan,
-          bytes: await this.downloadAndVerifyEntryBlob(store, token, plan),
-        };
+      async (plan): Promise<PreparedEntryBlob | null> => {
+        try {
+          return {
+            plan,
+            bytes: await this.downloadAndVerifyEntryBlob(store, token, plan),
+          };
+        } catch (error) {
+          if (error instanceof BlobVerificationError) {
+            // Permanent failure: quarantine this entry so the healthy entries in
+            // the batch still apply and the cursor advances past the poison blob.
+            this.deps.onDecryptFailure?.(error.entryId);
+            return null;
+          }
+          // Transient failure (missing blob, network, 5xx): preserve the
+          // all-or-nothing rollback + retry behavior.
+          throw error;
+        }
       },
+    );
+
+    return prepared.filter(
+      (entry): entry is PreparedEntryBlob => entry !== null,
     );
   }
 
@@ -78,11 +118,15 @@ export class PullBlobPreparer {
         `[osync] pull: failed to decrypt blob ${blobId} for entry ${plan.state.entryId} rev=${plan.state.revision}`,
         error,
       );
-      throw error;
+      throw new BlobVerificationError(
+        plan.state.entryId,
+        `Entry state ${plan.state.entryId}@${plan.state.revision} blob could not be decrypted.`,
+      );
     }
     const actualHash = await hashBytes(bytes);
     if (actualHash !== plan.hash) {
-      throw new Error(
+      throw new BlobVerificationError(
+        plan.state.entryId,
         `Entry state ${plan.state.entryId}@${plan.state.revision} hash does not match metadata.`,
       );
     }
