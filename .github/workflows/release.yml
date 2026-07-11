@@ -7,33 +7,34 @@ on:
 
 permissions:
   contents: write
-  id-token: write
-  attestations: write
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Build
-        run: npm run build
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: |
-            main.js
-            styles.css
+      # This repo is a release mirror of the plugin built in the private Osync
+      # monorepo. It does NOT rebuild from src here — rebuilding from a stale mirror
+      # once shipped an outdated main.js that overwrote the correct release assets.
+      # Instead we publish the committed, pre-built artifacts and fail loudly if they
+      # don't match the tag, so a mismatched mirror is caught instead of shipped.
+      - name: Verify committed artifacts match the tag
+        run: |
+          set -e
+          MANIFEST_VERSION="$(node -p "require('./manifest.json').version")"
+          if [ "$MANIFEST_VERSION" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::manifest.json version ($MANIFEST_VERSION) does not match tag (${GITHUB_REF_NAME}). Sync the plugin build before tagging."
+            exit 1
+          fi
+          for f in main.js manifest.json styles.css; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing committed artifact: $f"
+              exit 1
+            fi
+          done
+          echo "Artifacts verified for ${GITHUB_REF_NAME}."
 
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
