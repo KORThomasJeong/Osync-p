@@ -158,6 +158,28 @@ describe("OsyncSettingTab remote vault settings", () => {
     expect(getButtonComponents().map((button) => button.text)).toContain("Reset");
   });
 
+  it("purges excluded folders from the server when a vault is connected", async () => {
+    const purgeExcludedFoldersFromServer = vi.fn(async () => {});
+    const tab = createSettingsTab({
+      hasAuthenticatedSession: () => true,
+      hasConnectedRemoteVault: () => true,
+      purgeExcludedFoldersFromServer,
+    });
+
+    tab.display();
+
+    expect(getButtonComponents().map((button) => button.text)).toContain(
+      "Purge from server",
+    );
+
+    await getButtonComponents()
+      .find((button) => button.text === "Purge from server")
+      ?.click();
+    await nextTask();
+
+    expect(purgeExcludedFoldersFromServer).toHaveBeenCalledTimes(1);
+  });
+
   it("does not show vault configuration sync controls after sign-in", () => {
     const tab = createSettingsTab({
       hasAuthenticatedSession: () => true,

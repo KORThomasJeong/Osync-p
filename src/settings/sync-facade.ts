@@ -38,4 +38,5 @@ export interface OsyncSyncFacade {
     onProgress?: (done: number, total: number) => void,
   ): Promise<OsyncConflictCleanupResult>;
   resetLocalSyncStateInPlace(): Promise<void>;
+  purgeExcludedFoldersFromServer(): Promise<void>;
 }

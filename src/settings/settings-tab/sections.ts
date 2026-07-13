@@ -130,6 +130,7 @@ export function renderRemoteVaultSettings(
       | "resetLocalSyncStateInPlace"
       | "listConflictCopies"
       | "deleteConflictCopies"
+      | "purgeExcludedFoldersFromServer"
     >,
   hasConnectedRemoteVault: boolean,
   refresh: RefreshSettings,
@@ -205,6 +206,19 @@ export function renderRemoteVaultSettings(
             listConflictCopies: () => controller.listConflictCopies(),
             deleteConflictCopies: (paths, onProgress) => controller.deleteConflictCopies(paths, onProgress),
           }).open();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Purge excluded folders from server")
+      .setDesc(
+        "Remove files still on the server that this device's excluded folders no longer sync " +
+          "(e.g. after excluding a folder and deleting it locally). Local files are not touched.",
+      )
+      .addButton((button) =>
+        button.setButtonText("Purge from server").onClick(async () => {
+          await controller.purgeExcludedFoldersFromServer();
+          refresh();
         }),
       );
     return;

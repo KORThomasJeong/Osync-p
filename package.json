@@ -1,6 +1,6 @@
 {
   "name": "osync-obsidian-plugin",
-  "version": "2.2.5",
+  "version": "2.3.0",
   "description": "Self-hosted, end-to-end encrypted vault sync for Obsidian.",
   "main": "main.js",
   "scripts": {
