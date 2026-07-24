@@ -186,6 +186,15 @@ docker pull thomasjeong/osync:latest
 
 `linux/amd64` 및 `linux/arm64` 모두 지원합니다.
 
+**AVX2 미지원 CPU**(예: Intel Celeron/Pentium)는 AVX2 SIMD 없이 컴파일된
+baseline 빌드를 사용해야 합니다:
+
+```
+docker pull thomasjeong/osync:latest-baseline
+```
+
+`docker-compose.yml`로 쓸 때는 `.env`에 `IMAGE_TAG=latest-baseline`을 설정하세요.
+
 ### 포트
 
 | 포트 | 서비스 | 외부 노출 방식 |
@@ -267,6 +276,10 @@ location / {
 ```
 
 ### 트러블슈팅
+
+- **api 컨테이너가 `Illegal instruction (core dumped)`로 크래시** — CPU에 Bun 기본 빌드가 요구하는 AVX2 명령어가 없는 경우입니다(Intel Celeron/Pentium에서 흔함, `grep avx2 /proc/cpuinfo`로 확인). `.env`에 `IMAGE_TAG=latest-baseline`을 설정한 뒤 `docker compose pull && docker compose up -d` 하세요. baseline 빌드는 모든 x86_64 CPU에서 동작합니다.
+
+- **웹 UI가 한국어로 나오고 영어로 안 바뀜** — `.env`에 `LANGUAGE=en`을 설정하고 재시작하세요. (2.4.0에서 수정됨. 이전 이미지는 로드 순서 버그로 이 설정이 무시되었습니다.)
 
 - **업/다운로드 시 `SignatureDoesNotMatch`** — `MINIO_PUBLIC_URL` 또는 `S3_PUBLIC_ENDPOINT`가 클라이언트가 실제로 접속하는 호스트와 정확히 일치하지 않거나, 리버스 프록시가 MinIO로 `Host $host`를 넘기지 않는 경우입니다. 두 환경변수가 `osync-s3.your-domain.com`의 공개 URL과 일치하는지, 그리고 MinIO Nginx 블록에 `proxy_set_header Host $host;`가 있는지 확인하세요.
 

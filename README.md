@@ -186,6 +186,15 @@ docker pull thomasjeong/osync:latest
 
 Supports `linux/amd64` and `linux/arm64`.
 
+**CPUs without AVX2** (e.g. Intel Celeron/Pentium) must use the baseline build,
+which is compiled without AVX2 SIMD:
+
+```
+docker pull thomasjeong/osync:latest-baseline
+```
+
+Set `IMAGE_TAG=latest-baseline` in your `.env` to use it via `docker-compose.yml`.
+
 ### Ports
 
 | Port | Service | Public exposure |
@@ -267,6 +276,10 @@ location / {
 ```
 
 ### Troubleshooting
+
+- **api container crashes with `Illegal instruction (core dumped)`** — your CPU lacks the AVX2 instructions Bun's default build requires (common on Intel Celeron/Pentium; check with `grep avx2 /proc/cpuinfo`). Set `IMAGE_TAG=latest-baseline` in `.env`, then `docker compose pull && docker compose up -d`. The baseline build runs on any x86_64 CPU.
+
+- **Web UI is in Korean and won't switch to English** — set `LANGUAGE=en` in `.env` and restart. (Fixed in 2.4.0; older images had a load-order bug that ignored the setting.)
 
 - **`SignatureDoesNotMatch` on upload/download** — `MINIO_PUBLIC_URL` or `S3_PUBLIC_ENDPOINT` doesn't exactly match the host clients hit, OR your reverse proxy isn't passing `Host $host` to MinIO. Verify both env vars equal the public URL of `osync-s3.your-domain.com`, and that the MinIO Nginx block has `proxy_set_header Host $host;`.
 

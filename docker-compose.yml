@@ -1,6 +1,6 @@
 services:
   api:
-    image: thomasjeong/osync:latest
+    image: thomasjeong/osync:${IMAGE_TAG:-latest}
     container_name: osync-api
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
