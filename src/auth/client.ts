@@ -2,6 +2,25 @@ import { requestUrl } from "obsidian";
 
 export const DEVICE_AUTH_CLIENT_ID = "osync-obsidian-plugin";
 
+// Carries the HTTP status so callers can tell "the server rejected this session"
+// from "the server was not reachable". A thrown network error means the stored
+// sign-in is still perfectly good; only 401/403 means it is actually gone.
+export class AuthHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "AuthHttpError";
+  }
+}
+
+export function isAuthRejection(error: unknown): boolean {
+  return (
+    error instanceof AuthHttpError && (error.status === 401 || error.status === 403)
+  );
+}
+
 export interface DeviceAuthorizationStart {
   deviceCode: string;
   userCode: string;
@@ -192,7 +211,10 @@ export class AuthClient {
     });
 
     if (response.status !== 200) {
-      throw new Error(`session lookup failed with status ${response.status}`);
+      throw new AuthHttpError(
+        response.status,
+        `session lookup failed with status ${response.status}`,
+      );
     }
 
     const json = response.json as SessionResponse;

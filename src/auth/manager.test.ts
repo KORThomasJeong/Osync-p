@@ -2,6 +2,7 @@ import { Plugin } from "obsidian";
 import { describe, expect, it, vi } from "vitest";
 
 import { AuthManager } from "./manager";
+import { AuthHttpError } from "./client";
 import type { AuthClient, DeviceAuthorizationStart } from "./client";
 import {
   readAuthSessionToken,
@@ -61,7 +62,7 @@ describe("AuthManager", () => {
       plugin,
       authClient: {
         getAuthenticatedUser: vi.fn(async () => {
-          throw new Error("session lookup failed with status 401");
+          throw new AuthHttpError(401, "session lookup failed with status 401");
         }),
       } as unknown as AuthClient,
     });
@@ -72,6 +73,53 @@ describe("AuthManager", () => {
     expect(manager.getAuthSessionToken()).toBe("expired-token");
     expect(manager.getAuthStatusLabel()).toBe("Sign in again to sync.");
     await expect(readAuthSessionToken(plugin)).resolves.toBe("expired-token");
+  });
+
+  it("reports an unreachable server instead of demanding a new sign-in", async () => {
+    const plugin = new Plugin();
+    await writeAuthSessionToken(plugin, "stored-token");
+    const manager = createManager({
+      plugin,
+      authClient: {
+        getAuthenticatedUser: vi.fn(async () => {
+          throw new TypeError("Failed to fetch");
+        }),
+      } as unknown as AuthClient,
+    });
+
+    await manager.initialize();
+
+    expect(manager.hasAuthenticatedSession()).toBe(false);
+    expect(manager.getAuthSessionToken()).toBe("stored-token");
+    expect(manager.getAuthStatusLabel()).toBe(
+      "Can't reach the server. Retrying with the saved sign-in.",
+    );
+  });
+
+  it("stops reporting an unreachable server once the session verifies", async () => {
+    const plugin = new Plugin();
+    await writeAuthSessionToken(plugin, "stored-token");
+    const getAuthenticatedUser = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        email: "user@example.com",
+        name: "User One",
+      });
+    const manager = createManager({
+      plugin,
+      authClient: { getAuthenticatedUser } as unknown as AuthClient,
+    });
+
+    await manager.initialize();
+    expect(manager.getAuthStatusLabel()).toBe(
+      "Can't reach the server. Retrying with the saved sign-in.",
+    );
+
+    await manager.reverifyIfNeeded();
+
+    expect(manager.getAuthStatusLabel()).toBe("Signed in as user@example.com.");
   });
 
   it("reverifyIfNeeded does nothing when the session is already verified", async () => {

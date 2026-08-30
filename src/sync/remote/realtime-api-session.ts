@@ -57,6 +57,13 @@ export class SyncRealtimeApiSession implements SyncRealtimeSession {
     });
   }
 
+  async ping(timeoutMs?: number): Promise<void> {
+    const message = await this.transport.request({ type: "heartbeat" }, timeoutMs);
+    if (message.type !== "heartbeat_ack") {
+      throw new Error("heartbeat did not produce a heartbeat_ack response");
+    }
+  }
+
   async listEntryStates(input: {
     sinceCursor: number;
     targetCursor: number | null;

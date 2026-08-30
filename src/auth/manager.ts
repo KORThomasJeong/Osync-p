@@ -4,6 +4,7 @@ import type { Plugin } from "obsidian";
 
 import {
   AuthClient,
+  isAuthRejection,
   type AuthenticatedUserSession,
   type DeviceAuthorizationPollResult,
   type DeviceAuthorizationStart,
@@ -29,6 +30,7 @@ export class AuthManager {
   private authSessionToken = "";
   private authSessionVerified = false;
   private authNeedsRelogin = false;
+  private authServerUnreachable = false;
   private authDisplayName = "";
   private readonly authClient: AuthClient;
   private deviceLoginInFlight = false;
@@ -68,6 +70,10 @@ export class AuthManager {
     if (!this.hasAuthenticatedSession()) {
       if (this.authNeedsRelogin) {
         return "Sign in again to sync.";
+      }
+
+      if (this.authServerUnreachable) {
+        return "Can't reach the server. Retrying with the saved sign-in.";
       }
 
       return "Not signed in.";
@@ -257,8 +263,16 @@ export class AuthManager {
       }
 
       this.applyVerifiedSession(session);
-    } catch {
-      this.markAuthNeedsRelogin();
+    } catch (error) {
+      // Only a rejection from the server means the session is gone. A transport
+      // failure — waking with Wi-Fi not up yet, server down — leaves the stored
+      // token valid, so telling the user to sign in again would be a lie that
+      // costs them a full device re-login.
+      if (isAuthRejection(error)) {
+        this.markAuthNeedsRelogin();
+      } else {
+        this.markAuthServerUnreachable();
+      }
     } finally {
       this.deps.refreshUi();
     }
@@ -267,19 +281,26 @@ export class AuthManager {
   private applyVerifiedSession(session: AuthenticatedUserSession): void {
     this.authSessionVerified = true;
     this.authNeedsRelogin = false;
+    this.authServerUnreachable = false;
     this.authDisplayName = session.email || session.name || "";
   }
 
   private markAuthNeedsRelogin(): void {
     this.authSessionVerified = false;
     this.authNeedsRelogin = true;
+    this.authServerUnreachable = false;
     this.authDisplayName = "";
+  }
+
+  private markAuthServerUnreachable(): void {
+    this.authServerUnreachable = true;
   }
 
   private async clearLocalAuthSession(): Promise<void> {
     this.authSessionToken = "";
     this.authSessionVerified = false;
     this.authNeedsRelogin = false;
+    this.authServerUnreachable = false;
     this.authDisplayName = "";
     await clearAuthSessionToken(this.deps.plugin);
   }

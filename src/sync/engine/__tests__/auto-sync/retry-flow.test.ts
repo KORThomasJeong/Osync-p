@@ -46,6 +46,47 @@ describe("SyncAutoLoop retry flow", () => {
     await store.close();
   });
 
+  it("reconnects on resume when the held session is already dead", async () => {
+    const store = await createInitializedTestSyncStore(createTestPlugin());
+    const callbacks: SyncRealtimeCallbacks[] = [];
+    const closeSession = vi.fn();
+    const autoLoop = new SyncAutoLoop({
+      getApiBaseUrl: () => "http://127.0.0.1:8787",
+      getSyncToken: async () => createToken(),
+      getSyncStore: () => store,
+      pushPendingMutations: vi.fn(async () => createPushResult()),
+      pullOnce: vi.fn(async () => {}),
+      realtimeClient: createRealtimeClient(
+        (nextCallbacks) => {
+          callbacks.push(nextCallbacks);
+        },
+        (session) => {
+          if (callbacks.length > 1) {
+            return;
+          }
+
+          // The device slept past the server's idle timeout: the socket object is
+          // still here, but nothing on the other end answers.
+          session.ping = async () => {
+            throw new Error("sync websocket request timed out");
+          };
+          session.close = closeSession;
+        },
+      ),
+    });
+
+    await autoLoop.start();
+    expect(callbacks).toHaveLength(1);
+
+    await autoLoop.resumeConnection();
+
+    expect(callbacks).toHaveLength(2);
+    expect(closeSession).toHaveBeenCalled();
+
+    autoLoop.stop();
+    await store.close();
+  });
+
   it("resumes immediately while waiting for reconnect backoff", async () => {
     vi.useFakeTimers();
 

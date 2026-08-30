@@ -15,6 +15,7 @@ const DEFAULT_RECONNECT_DELAY_MS = 3_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_SYNC_RETRY_BASE_DELAY_MS = 1_000;
 const DEFAULT_SYNC_RETRY_MAX_DELAY_MS = 30_000;
+const RESUME_LIVENESS_PROBE_TIMEOUT_MS = 5_000;
 
 export interface SyncAutoLoopDeps {
   getApiBaseUrl: () => string;
@@ -176,12 +177,36 @@ export class SyncAutoLoop {
   }
 
   async resumeConnection(): Promise<void> {
-    if (!this.isActive() || this.realtimeSession) {
+    if (!this.isActive()) {
       return;
     }
 
+    if (this.realtimeSession && !(await this.isRealtimeSessionAlive())) {
+      // Woken from sleep holding a socket the server already dropped: its idle
+      // timeout expires while the device is suspended and our heartbeat timer is
+      // frozen, so the session object outlives the connection. Trusting it here
+      // would leave sync silently dead until the next heartbeat tick times out.
+      this.markRealtimeDisconnected(false);
+    }
+
+    // A wake-up is a fresh start, not the next step of a backoff ladder.
+    this.reconnectAttempt = 0;
     this.timers.clear("reconnect");
     await this.ensureRealtimeSession();
+  }
+
+  private async isRealtimeSessionAlive(): Promise<boolean> {
+    const session = this.realtimeSession;
+    if (!session) {
+      return false;
+    }
+
+    try {
+      await session.ping(RESUME_LIVENESS_PROBE_TIMEOUT_MS);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async openRealtimeSession(): Promise<void> {

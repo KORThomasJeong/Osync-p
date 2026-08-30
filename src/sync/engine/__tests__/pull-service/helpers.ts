@@ -311,6 +311,7 @@ export function createRealtimeSession(input: {
     async restoreEntryVersion() {
       throw new Error("pull tests should not restore entry versions");
     },
+    async ping() {},
     async ackCursor(cursor: number) {
       await input.onAckCursor?.(cursor);
     },

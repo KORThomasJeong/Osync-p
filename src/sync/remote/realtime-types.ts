@@ -80,6 +80,9 @@ export interface SyncRealtimeSession {
     blobId: string | null;
     encryptedMetadata: string;
   }): Promise<EntryVersionRestoredResponse>;
+  // Round-trips a heartbeat so a caller can tell a live socket from one the server
+  // already dropped. Rejects when the socket is closed or the ack does not arrive.
+  ping(timeoutMs?: number): Promise<void>;
   ackCursor(cursor: number): Promise<void>;
   commitMutation(mutation: CommitMutationPayload): Promise<CommitAcceptedResult>;
   commitMutations(mutations: CommitMutationPayload[]): Promise<CommitMutationsResult>;
