@@ -7,6 +7,7 @@ import {
 } from "./plugin/conflict-resolution-view";
 import { OsyncPluginController } from "./plugin/plugin-controller";
 import { OsyncStatusBar } from "./plugin/status-bar";
+import { OsyncSyncStatusRibbon } from "./plugin/sync-status-ribbon";
 import {
   OSYNC_VERSION_HISTORY_VIEW_TYPE,
   OsyncVersionHistoryView,
@@ -16,6 +17,7 @@ import { OsyncSettingTab } from "./settings/settings-tab";
 export default class OsyncPlugin extends Plugin {
   private controller: OsyncPluginController | null = null;
   private statusBar: OsyncStatusBar | null = null;
+  private statusRibbon: OsyncSyncStatusRibbon | null = null;
   private settingsTab: OsyncSettingTab | null = null;
 
   async onload(): Promise<void> {
@@ -33,6 +35,10 @@ export default class OsyncPlugin extends Plugin {
       void controller.toggleSyncPause();
     });
     this.statusBar.initialize();
+    this.statusRibbon = new OsyncSyncStatusRibbon(this, controller, () => {
+      controller.openSyncStatus();
+    });
+    this.statusRibbon.initialize();
 
     this.registerView(
       OSYNC_VERSION_HISTORY_VIEW_TYPE,
@@ -80,7 +86,13 @@ export default class OsyncPlugin extends Plugin {
     this.registerDomEvent(activeDocument, "visibilitychange", () => {
       if (activeDocument.visibilityState === "visible") {
         resume();
+      } else if (activeDocument.visibilityState === "hidden") {
+        controller.flushSyncOnHide();
       }
+    });
+    // iOS may suspend the app right after backgrounding; push pending changes first.
+    this.registerDomEvent(window, "pagehide", () => {
+      controller.flushSyncOnHide();
     });
     this.registerEvent(
       this.app.workspace.on("file-open", () => {
@@ -92,5 +104,6 @@ export default class OsyncPlugin extends Plugin {
   private refreshUi(): void {
     this.settingsTab?.refresh();
     this.statusBar?.refresh();
+    this.statusRibbon?.refresh();
   }
 }

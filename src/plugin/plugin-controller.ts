@@ -13,6 +13,9 @@ import { OsyncRemoteVaultController } from "./remote-vault-controller";
 import { OsyncVersionHistoryController } from "./version-history-controller";
 import type { VersionHistoryViewState } from "./version-history-view";
 import { OsyncFileExplorerMarker } from "./file-explorer-marker";
+import { ResumeGate } from "./resume-gate";
+import { OsyncSyncStatusModal, type OsyncSyncStatusSource } from "./sync-status-modal";
+import type { OsyncActivityLogEntry } from "./sync-status-presentation";
 import type {
   OsyncConflictCleanupResult,
   OsyncConflictCopy,
@@ -31,6 +34,7 @@ import {
 } from "../sync/core/conflict-cleanup";
 import { normalizeExcludedFolders, type SyncFileRules } from "../sync/core/file-rules";
 import type { SyncTokenResponse } from "../sync/remote/client";
+import { createVaultLocalActivityLogStorage } from "../sync/runtime/activity-log";
 import { SyncController } from "../sync/runtime/controller";
 import { VaultKeyCryptoService } from "../sync/core/crypto-service";
 import { SyncTokenManager } from "../sync/remote/token-manager";
@@ -54,15 +58,16 @@ export interface OsyncPluginControllerDeps {
   refreshUi: () => void;
 }
 
-export class OsyncPluginController implements OsyncSettingsController {
+export class OsyncPluginController implements OsyncSettingsController, OsyncSyncStatusSource {
   private readonly plugin = this.deps.plugin;
   private readonly pluginDataStore = new OsyncPluginDataStore(this.plugin);
   private readonly settingsStore = new OsyncSettingsStore(this.pluginDataStore);
   private storedRemoteVaultKeySecret: StoredRemoteVaultKeySecret | null = null;
   private storedSyncConnection: SyncConnection | null = null;
-  private resumeAutoSyncPromise: Promise<void> | null = null;
+  private readonly resumeGate = new ResumeGate();
   private storeCorruptionNotified = false;
   private fileExplorerMarker: OsyncFileExplorerMarker | null = null;
+  private readonly statusListeners = new Set<() => void>();
   private readonly authManager = new AuthManager({
     plugin: this.plugin,
     getApiBaseUrl: () => this.getApiBaseUrl(),
@@ -121,6 +126,7 @@ export class OsyncPluginController implements OsyncSettingsController {
   });
   private readonly syncController = new SyncController({
     plugin: this.plugin,
+    activityLogStorage: createVaultLocalActivityLogStorage(this.plugin),
     getApiBaseUrl: () => this.getApiBaseUrl(),
     getSyncToken: async () => await this.getSyncTokenForActiveRemoteVault(),
     invalidateSyncToken: () => {
@@ -203,7 +209,7 @@ export class OsyncPluginController implements OsyncSettingsController {
     } else {
       this.syncController.resumeAutoSyncFromPause();
     }
-    this.deps.refreshUi();
+    this.refreshUi();
   }
 
   // Remove server-side entries that live in this device's excluded folders (zombies whose
@@ -260,17 +266,15 @@ export class OsyncPluginController implements OsyncSettingsController {
   }
 
   queueAutoSyncResume(): void {
-    if (this.resumeAutoSyncPromise) {
-      return;
-    }
-
-    this.resumeAutoSyncPromise = this.recoverAndResume()
-      .catch((error) => {
+    // Deduped, but self-healing: a resume hung past RESUME_STALE_AFTER_MS
+    // (e.g. a request stuck across a mobile network change) stops blocking
+    // later focus/visibility/online triggers.
+    this.resumeGate.trigger(
+      () => this.recoverAndResume(),
+      (error) => {
         this.notifyError(error, "Auto sync resume failed");
-      })
-      .finally(() => {
-        this.resumeAutoSyncPromise = null;
-      });
+      },
+    );
   }
 
   private async recoverAndResume(): Promise<void> {
@@ -318,6 +322,10 @@ export class OsyncPluginController implements OsyncSettingsController {
 
   getSyncPercent(): number {
     return this.syncController.getSyncPercent();
+  }
+
+  getLastVerifiedAt(): number | null {
+    return this.syncController.getLastVerifiedAt();
   }
 
   getSyncProgress(): OsyncSyncProgress {
@@ -471,6 +479,64 @@ export class OsyncPluginController implements OsyncSettingsController {
     await workspace.revealLeaf(leaf);
   }
 
+  // --- Sync status modal / ribbon (OsyncSyncStatusSource) ---
+
+  openSyncStatus(): void {
+    new OsyncSyncStatusModal(this.plugin.app, this).open();
+  }
+
+  onStatusChange(listener: () => void): () => void {
+    this.statusListeners.add(listener);
+    const unsubscribeConflicts = this.getConflictQueue().onChange(listener);
+    return () => {
+      this.statusListeners.delete(listener);
+      unsubscribeConflicts();
+    };
+  }
+
+  getConflictCount(): number {
+    return this.getConflictQueue().count();
+  }
+
+  openConflicts(): void {
+    void this.openConflictResolutionPane().catch((error: unknown) => {
+      this.notifyError(error, "Open sync conflicts failed");
+    });
+  }
+
+  async checkNow(): Promise<void> {
+    await this.syncController.checkNow();
+  }
+
+  async getPendingUploadCount(): Promise<number> {
+    return await this.syncController.getPendingUploadCount();
+  }
+
+  getActivityLog(): readonly OsyncActivityLogEntry[] {
+    return this.syncController.getActivityLog();
+  }
+
+  onActivityLogChange(listener: () => void): () => void {
+    return this.syncController.onActivityLogChange(listener);
+  }
+
+  clearActivityLog(): void {
+    this.syncController.clearActivityLog();
+  }
+
+  // Best-effort push of pending local changes when the app is backgrounded
+  // (iOS may suspend it right after). Silent: no notice on failure.
+  flushSyncOnHide(): void {
+    if (this.isSyncPaused()) return;
+    try {
+      void Promise.resolve(this.syncController.flushPendingNow()).catch((error: unknown) => {
+        console.warn("[osync:flush-on-hide] failed", error);
+      });
+    } catch (error) {
+      console.warn("[osync:flush-on-hide] failed", error);
+    }
+  }
+
   async listActiveFileVersions(
     before: OsyncEntryVersionCursor | null,
     limit: number,
@@ -543,6 +609,17 @@ export class OsyncPluginController implements OsyncSettingsController {
 
   private refreshUi(): void {
     this.deps.refreshUi();
+    this.notifyStatusListeners();
+  }
+
+  private notifyStatusListeners(): void {
+    for (const listener of [...this.statusListeners]) {
+      try {
+        listener();
+      } catch (error) {
+        console.warn("[osync:status] listener failed", error);
+      }
+    }
   }
 
   private async saveStoredRemoteVaultKeySecret(

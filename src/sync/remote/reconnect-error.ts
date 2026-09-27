@@ -1,4 +1,4 @@
-import { SyncHttpError } from "../../http/request";
+import { RequestTimeoutError, SyncHttpError } from "../../http/request";
 import { RemoteVaultPasswordChangedError } from "../../remote-vault/types";
 import { SyncRealtimeError } from "./realtime-types";
 
@@ -22,6 +22,11 @@ const AUTH_CODE_FRAGMENTS = [
 ];
 
 export function classifyReconnectError(error: unknown): ReconnectErrorClassification {
+  // The server never answered — a transport failure, never a session problem.
+  if (error instanceof RequestTimeoutError) {
+    return { kind: "transient" };
+  }
+
   if (error instanceof SyncHttpError) {
     if (error.status === 401 || error.status === 403) {
       return { kind: "actionable", userMessage: SESSION_EXPIRED_MESSAGE };

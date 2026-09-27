@@ -258,6 +258,169 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("resume verification status", () => {
+    type LoopDeps = {
+      onVerificationStarted?: () => void;
+      onError?: (error: unknown) => void;
+    };
+    const loopDepsOf = (engine: SyncEngine): LoopDeps =>
+      (engine as unknown as { syncAutoLoop: { deps: LoopDeps } }).syncAutoLoop.deps;
+
+    it("shows checking while a resume re-verifies the server cursor", () => {
+      const setSyncStatus = vi.fn();
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        setSyncStatus,
+      });
+
+      loopDepsOf(engine).onVerificationStarted?.();
+
+      expect(setSyncStatus).toHaveBeenLastCalledWith("checking");
+    });
+
+    it("keeps an escalated attention state visible during the check", () => {
+      const setSyncStatus = vi.fn();
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        setSyncStatus,
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const deps = loopDepsOf(engine);
+      for (let i = 0; i < 5; i += 1) {
+        deps.onError?.(new Error("server exploded"));
+      }
+      expect(setSyncStatus).toHaveBeenLastCalledWith("attention_needed");
+
+      deps.onVerificationStarted?.();
+
+      expect(setSyncStatus).not.toHaveBeenCalledWith("checking");
+    });
+
+    it("exposes the loop's last verification time", () => {
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")));
+
+      expect(engine.getLastVerifiedAt()).toBeNull();
+      engine.markVerified();
+      expect(engine.getLastVerifiedAt()).toEqual(expect.any(Number));
+    });
+  });
+
+  describe("activity recording", () => {
+    type ActivityLoopDeps = {
+      pullOnce: (session: unknown) => Promise<unknown>;
+      pushPendingMutations: (session: unknown) => Promise<unknown>;
+      onError?: (error: unknown) => void;
+      onActivity?: (kind: string, message: string) => void;
+    };
+    const loopDepsOf = (engine: SyncEngine): ActivityLoopDeps =>
+      (engine as unknown as { syncAutoLoop: { deps: ActivityLoopDeps } }).syncAutoLoop.deps;
+    const servicesOf = (engine: SyncEngine) =>
+      engine as unknown as {
+        syncPullService: { pullOnce: (session: unknown) => Promise<unknown> };
+        syncPushService: { pushPendingMutations: (session: unknown) => Promise<unknown> };
+      };
+
+    function createRecordingEngine() {
+      const recordActivity = vi.fn();
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        recordActivity,
+      });
+      return { engine, recordActivity };
+    }
+
+    it("records pull results with counts and cursor", async () => {
+      const { engine, recordActivity } = createRecordingEngine();
+      vi.spyOn(servicesOf(engine).syncPullService, "pullOnce").mockResolvedValue({
+        cursor: 12,
+        entriesApplied: 3,
+        filesWritten: 2,
+        filesDeleted: 1,
+        conflictsCreated: 0,
+      });
+
+      await loopDepsOf(engine).pullOnce({});
+
+      expect(recordActivity).toHaveBeenCalledWith("pull", expect.stringContaining("12"));
+      const message = recordActivity.mock.calls.find(([kind]) => kind === "pull")?.[1] as string;
+      expect(message).toMatch(/3/);
+      expect(message).toMatch(/2/);
+    });
+
+    it("records pushes that sent mutations and skips empty ones", async () => {
+      const { engine, recordActivity } = createRecordingEngine();
+      const push = vi.spyOn(servicesOf(engine).syncPushService, "pushPendingMutations");
+      push.mockResolvedValueOnce({
+        cursor: 0,
+        mutationsPushed: 0,
+        mutationsRequeued: 0,
+        filesCreatedOrUpdated: 0,
+        filesDeleted: 0,
+        conflictsCreated: 0,
+        shouldPullAfterPush: false,
+        hasMore: false,
+      });
+      await loopDepsOf(engine).pushPendingMutations({});
+      expect(recordActivity).not.toHaveBeenCalledWith("push", expect.anything());
+
+      push.mockResolvedValueOnce({
+        cursor: 9,
+        mutationsPushed: 4,
+        mutationsRequeued: 0,
+        filesCreatedOrUpdated: 4,
+        filesDeleted: 0,
+        conflictsCreated: 0,
+        shouldPullAfterPush: false,
+        hasMore: false,
+      });
+      await loopDepsOf(engine).pushPendingMutations({});
+      expect(recordActivity).toHaveBeenCalledWith("push", expect.stringContaining("4"));
+    });
+
+    it("records quiet and escalated errors", () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const { engine, recordActivity } = createRecordingEngine();
+
+      loopDepsOf(engine).onError?.(new Error("socket hiccup"));
+      expect(recordActivity).toHaveBeenLastCalledWith(
+        "error",
+        expect.stringContaining("socket hiccup"),
+      );
+      // The fifth consecutive transient error escalates.
+      for (let i = 0; i < 4; i += 1) {
+        loopDepsOf(engine).onError?.(new Error("server exploded"));
+      }
+      expect(recordActivity).toHaveBeenLastCalledWith(
+        "error",
+        expect.stringMatching(/escalated.*server exploded/i),
+      );
+    });
+
+    it("forwards loop activity and records conflicts with paths", () => {
+      const { engine, recordActivity } = createRecordingEngine();
+
+      loopDepsOf(engine).onActivity?.("connect", "Connected");
+      expect(recordActivity).toHaveBeenCalledWith("connect", "Connected");
+
+      const conflictDeps = (engine as unknown as {
+        syncPullService: { deps: { onConflict: (event: unknown) => void } };
+      }).syncPullService.deps;
+      conflictDeps.onConflict({
+        op: "upsert",
+        reason: "local_pending_mutation",
+        originalPath: "notes/a.md",
+        conflictPath: "notes/a (conflict).md",
+      });
+      expect(recordActivity).toHaveBeenCalledWith(
+        "conflict",
+        expect.stringContaining("notes/a.md"),
+      );
+    });
+
+    it("counts pending uploads in the store", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const engine = createEngine(plugin);
+      expect(await engine.countPendingMutations()).toBe(0);
+    });
+  });
+
   describe("drainInFlightSync", () => {
     it("waits for an in-flight pull to finish before resolving", async () => {
       const plugin = createPlugin({}, async () => encodeUtf8("body"));

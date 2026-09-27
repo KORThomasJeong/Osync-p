@@ -1,4 +1,5 @@
 import {
+  BLOB_TRANSFER_TIMEOUT_MS,
   defaultHttpClient,
   extractErrorMessage,
   stripTrailingSlash,
@@ -69,6 +70,7 @@ export class SyncBlobClient {
         url: signed.url,
         method: "PUT",
         body: toArrayBuffer(bytes),
+        timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
       });
       this.throwUnlessUploadSucceeded(putResponse);
       return;
@@ -92,6 +94,7 @@ export class SyncBlobClient {
           authorization: `Bearer ${syncToken}`,
           "x-blob-size": String(bytes.byteLength),
         },
+        timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
       });
       this.throwUnlessUploadSucceeded(response);
       return;
@@ -118,6 +121,7 @@ export class SyncBlobClient {
       url: signed.url,
       method: "PUT",
       body: toArrayBuffer(bytes),
+      timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
     });
     this.throwUnlessUploadSucceeded(putResponse);
   }

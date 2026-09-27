@@ -1,4 +1,5 @@
 import {
+  BLOB_TRANSFER_TIMEOUT_MS,
   defaultHttpClient,
   extractErrorMessage,
   stripTrailingSlash,
@@ -19,6 +20,7 @@ export interface SyncAuthorizedRequestInput {
   method?: string;
   headers?: Record<string, string>;
   body?: ArrayBuffer | string;
+  timeoutMs?: number;
 }
 
 export interface SyncAuthorizedRequestResult {
@@ -56,6 +58,7 @@ export class SyncHttpClient {
           ...input.headers,
         },
         body: input.body,
+        ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
       });
 
       if (response.status !== 401 || retrying) {
@@ -95,6 +98,7 @@ export class SyncHttpClient {
     const { response } = await this.request({
       path: () => path,
       method: "GET",
+      timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
     });
     return readBytesOrThrow(response);
   }
@@ -114,6 +118,7 @@ export class SyncHttpClient {
       method: "PUT",
       headers: extraHeaders,
       body: toArrayBuffer(bytes),
+      timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
     });
     return response;
   }

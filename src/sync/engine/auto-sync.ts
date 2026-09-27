@@ -16,6 +16,12 @@ const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_SYNC_RETRY_BASE_DELAY_MS = 1_000;
 const DEFAULT_SYNC_RETRY_MAX_DELAY_MS = 30_000;
 const RESUME_LIVENESS_PROBE_TIMEOUT_MS = 5_000;
+// Heartbeats confirm the cursor every ~30s; only log one when it says something new.
+const VERIFY_LOG_MIN_INTERVAL_MS = 5 * 60_000;
+
+// The subset of activity-log kinds the loop itself reports.
+export type AutoSyncActivityKind = "connect" | "disconnect" | "resume" | "verify";
+type VerificationSource = "hello" | "pull" | "heartbeat";
 
 export interface SyncAutoLoopDeps {
   getApiBaseUrl: () => string;
@@ -34,8 +40,11 @@ export interface SyncAutoLoopDeps {
   onConnectionStateChange?: (state: SyncConnectionState) => void;
   onStorageStatusChange?: (status: SyncStorageStatus | null) => void;
   onSyncScheduled?: () => void;
+  // A resume began re-checking the server; "up to date" is no longer known to hold.
+  onVerificationStarted?: () => void;
   onIdle?: () => void;
   onError?: (error: unknown) => void;
+  onActivity?: (kind: AutoSyncActivityKind, message: string) => void;
 }
 
 export interface SyncRealtimeClientLike {
@@ -49,10 +58,13 @@ export class SyncAutoLoop {
   private drainPromise: Promise<void> | null = null;
   private readonly timers = new AutoSyncTimers();
   private reconnectAttempt = 0;
+  private pullRequestCount = 0;
   private syncRetryAttempt = 0;
   private readonly state: SyncAutoLoopState;
   private storageStatusWatching = false;
   private readonly pendingWork = new PendingSyncWorkQueue();
+  private lastVerifiedAt: number | null = null;
+  private lastLoggedVerification: { cursor: number; at: number } | null = null;
 
   constructor(private readonly deps: SyncAutoLoopDeps) {
     this.realtimeClient = deps.realtimeClient ?? new SyncRealtimeClient();
@@ -60,7 +72,9 @@ export class SyncAutoLoop {
   }
 
   async start(): Promise<boolean> {
-    if (this.isActive()) {
+    // A paused loop is left for resume(): starting it here would silently undo a
+    // user (or delete-burst) pause whenever the app returns to the foreground.
+    if (this.isActive() || this.state.current === "paused") {
       return false;
     }
 
@@ -75,6 +89,8 @@ export class SyncAutoLoop {
     this.timers.clearAll();
     this.realtimeSession?.close();
     this.realtimeSession = null;
+    this.lastVerifiedAt = null;
+    this.lastLoggedVerification = null;
   }
 
   pause(): void {
@@ -89,14 +105,38 @@ export class SyncAutoLoop {
     if (this.state.current !== "paused") {
       return;
     }
-    this.state.set("live");
-    if (!this.realtimeSession) {
-      void this.ensureRealtimeSession();
-    } else if (this.hasPendingWork()) {
-      void this.drain();
-    } else {
-      this.deps.onIdle?.();
+    this.state.resumeFromPause();
+    // Treat it like a wake-up: the socket may have died while paused (its close is
+    // ignored then) and cursor broadcasts may have been missed, so verify the socket
+    // and catch up instead of reporting "up to date" from an empty local queue.
+    void this.resumeConnection();
+  }
+
+  // Time of the last confirmation that we are caught up with the server cursor
+  // (a completed pull, or a hello/ack whose cursor was not ahead). Null until then.
+  getLastVerifiedAt(): number | null {
+    return this.lastVerifiedAt;
+  }
+
+  markVerified(): void {
+    this.lastVerifiedAt = Date.now();
+  }
+
+  // Started and not stopped (a paused loop counts as started).
+  isStarted(): boolean {
+    return this.state.current !== "stopped";
+  }
+
+  // Push queued local mutations now instead of waiting for the debounce (e.g. the
+  // app is being hidden and may be suspended before the timer fires).
+  async flushPendingPush(): Promise<void> {
+    if (!this.isActive()) {
+      return;
     }
+
+    this.timers.clear("push");
+    this.requestPush();
+    await this.drain();
   }
 
   getMaxFileSizeBytes(): number {
@@ -116,6 +156,12 @@ export class SyncAutoLoop {
   }
 
   requestPull(targetCursor: number | null = null): void {
+    if (this.state.current === "paused") {
+      // Keep the target so resume() pulls it; dropping it here is how a paused loop
+      // came back claiming "up to date" while changes were waiting on the server.
+      this.requestPullWork(targetCursor);
+      return;
+    }
     if (!this.isActive()) {
       return;
     }
@@ -172,7 +218,7 @@ export class SyncAutoLoop {
     }
 
     this.timers.clear("reconnect");
-    this.markRealtimeDisconnected(false);
+    this.markRealtimeDisconnected(false, "Reconnect requested");
     void this.ensureRealtimeSession();
   }
 
@@ -181,18 +227,41 @@ export class SyncAutoLoop {
       return;
     }
 
+    this.deps.onVerificationStarted?.();
+    this.reportActivity("resume", "Resume: verifying connection");
+    const pullRequestsBeforeProbe = this.pullRequestCount;
     if (this.realtimeSession && !(await this.isRealtimeSessionAlive())) {
       // Woken from sleep holding a socket the server already dropped: its idle
       // timeout expires while the device is suspended and our heartbeat timer is
       // frozen, so the session object outlives the connection. Trusting it here
       // would leave sync silently dead until the next heartbeat tick times out.
-      this.markRealtimeDisconnected(false);
+      this.markRealtimeDisconnected(false, "Liveness ping failed; reconnecting");
+    }
+    if (!this.isActive()) {
+      return;
     }
 
     // A wake-up is a fresh start, not the next step of a backoff ladder.
     this.reconnectAttempt = 0;
     this.timers.clear("reconnect");
+    this.resetSyncRetry();
+    const keptSession = this.realtimeSession !== null;
     await this.ensureRealtimeSession();
+    if (!this.isActive() || !this.realtimeSession) {
+      // Reconnect is scheduled; the new session's hello cursor decides the pull.
+      return;
+    }
+
+    if (keptSession && this.pullRequestCount === pullRequestsBeforeProbe) {
+      // A surviving socket proves nothing about broadcasts sent while we were
+      // suspended. A pull from the stored cursor is cheap when nothing changed.
+      // Skipped when the probe's heartbeat_ack already revealed a missed cursor
+      // and queued a pull — that pull started after the probe and covers it.
+      this.requestPullWork(null);
+    }
+    if (this.hasPendingWork() || this.drainPromise) {
+      await this.drain();
+    }
   }
 
   private async isRealtimeSessionAlive(): Promise<boolean> {
@@ -238,7 +307,10 @@ export class SyncAutoLoop {
             this.deps.onStorageStatusChange?.(status);
           },
           onClose: () => {
-            this.markRealtimeDisconnected();
+            this.markRealtimeDisconnected(true, "Socket closed");
+          },
+          onServerCursorConfirmed: (confirmedCursor) => {
+            void this.confirmServerCursor(confirmedCursor);
           },
           onError: (error) => {
             this.handleError(error);
@@ -255,9 +327,15 @@ export class SyncAutoLoop {
       if (this.storageStatusWatching) {
         this.applyStorageStatusWatch();
       }
+      this.reportActivity(
+        "connect",
+        `Connected (cursor local ${cursor} → server ${session.serverCursor})`,
+      );
       if (session.serverCursor > cursor) {
         this.deps.onSyncScheduled?.();
         this.requestPullWork(session.serverCursor);
+      } else {
+        this.recordVerification(session.serverCursor, "hello");
       }
       this.state.goLive();
       if (this.hasPendingWork()) {
@@ -286,12 +364,15 @@ export class SyncAutoLoop {
     }, delay);
   }
 
-  private markRealtimeDisconnected(scheduleReconnect = true): void {
+  private markRealtimeDisconnected(scheduleReconnect = true, reason?: string): void {
     if (!this.isActive()) {
       return;
     }
 
     const session = this.realtimeSession;
+    if (session && reason) {
+      this.reportActivity("disconnect", reason);
+    }
     this.realtimeSession = null;
     this.deps.onStorageStatusChange?.(null);
     session?.close();
@@ -379,7 +460,10 @@ export class SyncAutoLoop {
           if (!session) {
             throw new Error("Sync realtime session is not connected.");
           }
-          await this.deps.pullOnce(session);
+          this.recordVerification(
+            cursorOfPullResult(await this.deps.pullOnce(session)),
+            "pull",
+          );
           shouldPullNow = false;
         }
         if (shouldPush) {
@@ -397,7 +481,10 @@ export class SyncAutoLoop {
           if (!session) {
             throw new Error("Sync realtime session is not connected.");
           }
-          await this.deps.pullOnce(session);
+          this.recordVerification(
+            cursorOfPullResult(await this.deps.pullOnce(session)),
+            "pull",
+          );
         }
         this.resetSyncRetry();
       } catch (error) {
@@ -448,6 +535,7 @@ export class SyncAutoLoop {
   }
 
   private requestPullWork(targetCursor: number | null): void {
+    this.pullRequestCount += 1;
     this.pendingWork.requestPull(targetCursor);
   }
 
@@ -462,4 +550,73 @@ export class SyncAutoLoop {
   private handleError(error: unknown): void {
     this.deps.onError?.(error);
   }
+
+  // A heartbeat ack reported a server cursor the session already knew. It proves we
+  // are caught up only if nothing is still waiting to be pulled and the stored
+  // cursor has actually reached it.
+  private async confirmServerCursor(cursor: number): Promise<void> {
+    if (!this.canConfirmServerCursor()) {
+      return;
+    }
+    const store = this.deps.getSyncStore();
+    if (!store) {
+      return;
+    }
+    let localCursor: number;
+    try {
+      localCursor = await store.getCursor();
+    } catch {
+      return;
+    }
+    if (localCursor < cursor || !this.canConfirmServerCursor()) {
+      return;
+    }
+    this.recordVerification(cursor, "heartbeat");
+  }
+
+  private canConfirmServerCursor(): boolean {
+    return (
+      this.isActive() &&
+      this.pendingWork.pullTargetCursor === null &&
+      this.drainPromise === null
+    );
+  }
+
+  private recordVerification(cursor: number | null, source: VerificationSource): void {
+    this.markVerified();
+    if (cursor === null) {
+      return;
+    }
+    const at = this.lastVerifiedAt ?? Date.now();
+    const previous = this.lastLoggedVerification;
+    // Connects and pulls already log their cursor; only heartbeats get their own
+    // line, and only when the cursor moved or a while has passed.
+    const shouldLog =
+      source === "heartbeat" &&
+      (previous === null ||
+        previous.cursor !== cursor ||
+        at - previous.at >= VERIFY_LOG_MIN_INTERVAL_MS);
+    if (source !== "heartbeat" || shouldLog) {
+      this.lastLoggedVerification = { cursor, at };
+    }
+    if (shouldLog) {
+      this.reportActivity("verify", `Heartbeat confirmed server cursor ${cursor}`);
+    }
+  }
+
+  private reportActivity(kind: AutoSyncActivityKind, message: string): void {
+    try {
+      this.deps.onActivity?.(kind, message);
+    } catch {
+      // Diagnostics must never break sync.
+    }
+  }
+}
+
+function cursorOfPullResult(result: unknown): number | null {
+  if (typeof result !== "object" || result === null) {
+    return null;
+  }
+  const cursor = (result as { cursor?: unknown }).cursor;
+  return typeof cursor === "number" && Number.isFinite(cursor) ? cursor : null;
 }

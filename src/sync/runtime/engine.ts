@@ -40,11 +40,19 @@ import type { UserVisibleSyncState } from "./user-visible-status";
 import type { UserVisibleSyncProgress } from "./user-visible-status";
 import { SyncVaultEventHandler } from "./vault-event-handler";
 import {
+  describeActivityError,
+  type SyncActivityKind as SyncActivityLogKind,
+} from "./activity-log";
+import type { PullOnceResult } from "../engine/pull-service";
+import type { PushPendingMutationsResult } from "../engine/push-service";
+import {
   SyncVersionHistoryService,
   type SyncEntryVersionsPage,
 } from "./version-history-service";
 
 type SyncActivityKind = "push" | "pull" | "local";
+
+type SyncConflictEvent = Parameters<SyncEngineDeps["notifySyncConflict"]>[0];
 
 interface ActiveSyncActivity {
   id: number;
@@ -77,6 +85,8 @@ export interface SyncEngineDeps {
   setSyncProgress: (progress: UserVisibleSyncProgress | null) => void;
   setSyncStatus: (status: UserVisibleSyncState) => void;
   setStorageStatus: (status: SyncStorageStatus | null) => void;
+  // Diagnostics trail (see activity-log.ts). Optional so tests can omit it.
+  recordActivity?: (kind: SyncActivityLogKind, message: string) => void;
 }
 
 export class SyncEngine {
@@ -116,7 +126,7 @@ export class SyncEngine {
     onProgress: async (progress) => {
       this.reportActivityProgress(progress);
     },
-    onConflict: (event) => this.deps.notifySyncConflict(event),
+    onConflict: (event) => this.handleSyncConflict(event),
   });
   private readonly syncLocalReconcileService = new SyncLocalReconcileService({
     getSyncStore: () => this.syncStore,
@@ -130,12 +140,12 @@ export class SyncEngine {
     getSyncStore: () => this.syncStore,
     pushPendingMutations: async (session) =>
       await this.withSyncActivity("push", async () => {
-        return await this.syncPushService.pushPendingMutations(session);
+        const result = await this.syncPushService.pushPendingMutations(session);
+        this.recordPushResult(result);
+        return result;
       }),
-    pullOnce: async (session) =>
-      await this.withSyncActivity("pull", async () => {
-        return await this.syncPullService.pullOnce(session);
-      }),
+    pullOnce: async (session) => await this.pullWithActivity(session),
+    onActivity: (kind, message) => this.recordActivity(kind, message),
     onConnectionStateChange: (state) => {
       if (state === "reconnecting") {
         // Keep an actionable attention state visible while the loop quietly
@@ -157,6 +167,12 @@ export class SyncEngine {
       this.clearActionableAttention();
       this.deps.setSyncStatus("syncing");
     },
+    onVerificationStarted: () => {
+      // Leave an escalated failure visible; it clears once the catch-up succeeds.
+      if (!this.actionableAttention) {
+        this.deps.setSyncStatus("checking");
+      }
+    },
     onIdle: () => {
       this.clearActionableAttention();
       this.deps.setSyncStatus("up_to_date");
@@ -167,10 +183,12 @@ export class SyncEngine {
         // Below the repeat threshold: likely a transient network blip. Keep retrying
         // quietly, but log so a persistent failure leaves a trail before it escalates.
         console.error("[osync] sync error (retrying)", error);
+        this.recordActivity("error", `Error (retrying): ${describeActivityError(error)}`);
         return;
       }
 
       console.error("[osync] sync error (escalated)", error);
+      this.recordActivity("error", `Error (escalated): ${describeActivityError(error)}`);
       this.actionableAttention = true;
       this.deps.setSyncStatus("attention_needed");
       const message = decision.message;
@@ -188,10 +206,15 @@ export class SyncEngine {
     runLocalMutationWork: async (work) => await this.runLocalMutationWork(work),
     hasActiveRemoteVaultSession: () => this.deps.hasActiveRemoteVaultSession(),
     onError: (error) => {
+      this.recordActivity(
+        "error",
+        `Sync event handling failed: ${describeActivityError(error)}`,
+      );
       this.deps.setSyncStatus("attention_needed");
       this.deps.notifyError(error, "Sync event handling failed");
     },
     onDeleteBurst: () => {
+      this.recordActivity("error", "Paused: many files deleted at once");
       // Many files deleted at once while Obsidian is open (script/tool). Pause pushing
       // those deletions and alert so the user can restore from server if unintended.
       this.syncAutoLoop.pause();
@@ -214,7 +237,7 @@ export class SyncEngine {
     onProgress: async (progress) => {
       this.reportActivityProgress(progress);
     },
-    onConflict: (event) => this.deps.notifySyncConflict(event),
+    onConflict: (event) => this.handleSyncConflict(event),
     isInitialDownloadSync: async () => {
       if (!this.syncStore) return false;
       const conn = await readStoredSyncConnection(this.syncStore);
@@ -236,9 +259,7 @@ export class SyncEngine {
     withRealtimeSession: async (work) => await this.withRealtimeSession(work),
     runLocalMutationWork: async (work) => await this.runLocalMutationWork(work),
     pullOnce: async (session) => {
-      await this.withSyncActivity("pull", async () => {
-        await this.syncPullService.pullOnce(session);
-      });
+      await this.pullWithActivity(session);
     },
   });
   constructor(private readonly deps: SyncEngineDeps) {}
@@ -336,6 +357,35 @@ export class SyncEngine {
     await this.syncAutoLoop.resumeConnection();
   }
 
+  isAutoSyncStarted(): boolean {
+    return this.syncAutoLoop.isStarted();
+  }
+
+  // Push queued local mutations now, skipping the debounce. Waits for vault events
+  // still being recorded so their mutations are part of the push.
+  async flushPendingPush(): Promise<void> {
+    await this.waitForLocalMutationWork();
+    await this.syncAutoLoop.flushPendingPush();
+  }
+
+  recordActivity(kind: SyncActivityLogKind, message: string): void {
+    try {
+      this.deps.recordActivity?.(kind, message);
+    } catch {
+      // Diagnostics must never break sync.
+    }
+  }
+
+  getLastVerifiedAt(): number | null {
+    return this.syncAutoLoop.getLastVerifiedAt();
+  }
+
+  // Entry point for other confirmations that we are caught up with the server
+  // (e.g. a heartbeat ack whose cursor is not ahead of ours).
+  markVerified(): void {
+    this.syncAutoLoop.markVerified();
+  }
+
   registerVaultEvents(): void {
     this.syncVaultEventHandler.register();
   }
@@ -373,9 +423,7 @@ export class SyncEngine {
   async runInitialPullIfRequired(): Promise<void> {
     if (!(await this.isInitialPullRequired())) return;
     await this.withRealtimeSession(async (session) => {
-      await this.withSyncActivity("pull", async () => {
-        await this.syncPullService.pullOnce(session);
-      });
+      await this.pullWithActivity(session);
     });
   }
 
@@ -488,6 +536,11 @@ export class SyncEngine {
     this.reportBaselineProgress(await store.countSyncProgress());
   }
 
+  async countPendingMutations(): Promise<number> {
+    const pending = await this.syncStore?.listDirtyEntries();
+    return pending?.length ?? 0;
+  }
+
   async hasPendingMutations(): Promise<boolean> {
     const pending = await this.syncStore?.listDirtyEntries(1);
     return (pending?.length ?? 0) > 0;
@@ -560,6 +613,50 @@ export class SyncEngine {
     work: (session: SyncRealtimeSession) => Promise<T>,
   ): Promise<T> {
     return await this.syncAutoLoop.withRealtimeSession(work);
+  }
+
+  private async pullWithActivity(session: SyncRealtimeSession): Promise<PullOnceResult> {
+    return await this.withSyncActivity("pull", async () => {
+      const result = await this.syncPullService.pullOnce(session);
+      this.recordPullResult(result);
+      return result;
+    });
+  }
+
+  private recordPullResult(result: PullOnceResult): void {
+    const changes =
+      result.entriesApplied === 0 && result.filesWritten === 0 && result.filesDeleted === 0
+        ? "no changes"
+        : `${result.entriesApplied} applied, ${result.filesWritten} written, ${result.filesDeleted} deleted`;
+    const conflicts =
+      result.conflictsCreated > 0 ? `, ${result.conflictsCreated} conflicts` : "";
+    this.recordActivity("pull", `Pulled to cursor ${result.cursor}: ${changes}${conflicts}`);
+  }
+
+  private recordPushResult(result: PushPendingMutationsResult): void {
+    if (
+      result.mutationsPushed === 0 &&
+      result.mutationsRequeued === 0 &&
+      result.conflictsCreated === 0
+    ) {
+      return;
+    }
+    const requeued =
+      result.mutationsRequeued > 0 ? `, ${result.mutationsRequeued} requeued` : "";
+    const conflicts =
+      result.conflictsCreated > 0 ? `, ${result.conflictsCreated} conflicts` : "";
+    const more = result.hasMore ? ", more pending" : "";
+    this.recordActivity(
+      "push",
+      `Pushed ${result.mutationsPushed} changes${requeued}${conflicts} (cursor ${result.cursor})${more}`,
+    );
+  }
+
+  private handleSyncConflict(event: SyncConflictEvent): void {
+    const detail = event.reason ?? event.op;
+    const target = event.conflictPath ? ` → ${event.conflictPath}` : "";
+    this.recordActivity("conflict", `Conflict (${detail}): ${event.originalPath}${target}`);
+    this.deps.notifySyncConflict(event);
   }
 
   private runLocalMutationWork<T>(work: () => Promise<T>): Promise<T> {

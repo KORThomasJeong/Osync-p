@@ -9,6 +9,9 @@ export interface SyncRealtimeCallbacks {
   onStorageStatusUpdated(status: SyncStorageStatus): void;
   onClose(): void;
   onError(error: Error): void;
+  // A heartbeat ack reported a server cursor we already knew about: nothing was
+  // missed up to `cursor`. Not called by older servers that omit the cursor.
+  onServerCursorConfirmed?(cursor: number): void;
 }
 
 export interface SyncStorageStatus {
@@ -227,6 +230,8 @@ export type ServerMessage =
   | {
       type: "heartbeat_ack";
       requestId: string;
+      // Vault's current server cursor. Absent on servers that predate it.
+      cursor?: number;
     }
   | {
       type: "session_error";

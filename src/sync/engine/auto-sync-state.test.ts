@@ -44,4 +44,20 @@ describe("SyncAutoLoopState 가드 전이", () => {
     state.goLive();
     expect(cb).toHaveBeenCalledWith("live");
   });
+
+  it("paused → live: resumeFromPause() 성공", () => {
+    const state = new SyncAutoLoopState();
+    state.startConnecting();
+    state.goLive();
+    state.pause();
+    state.resumeFromPause();
+    expect(state.current).toBe("live");
+  });
+
+  it("paused 가 아니면 resumeFromPause() 실패", () => {
+    const state = new SyncAutoLoopState();
+    expect(() => state.resumeFromPause()).toThrow();
+    state.startConnecting();
+    expect(() => state.resumeFromPause()).toThrow();
+  });
 });

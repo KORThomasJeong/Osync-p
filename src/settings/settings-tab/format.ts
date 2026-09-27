@@ -2,13 +2,14 @@ import type { OsyncSyncProgress, OsyncSyncState } from "../../plugin/view-models
 import type { OsyncSyncFacade } from "../sync-facade";
 
 export function shouldShowSyncSpinner(state: OsyncSyncState): boolean {
-  return state === "syncing" || state === "reconnecting";
+  return state === "syncing" || state === "reconnecting" || state === "checking";
 }
 
 export function formatSyncDescription(
   statusLabel: string,
   syncProgress: OsyncSyncProgress,
   storageStatus: ReturnType<OsyncSyncFacade["getStorageStatus"]>,
+  lastVerifiedLabel: string | null = null,
 ): string {
   const parts = [
     `${statusLabel} - ${syncProgress.completedEntries} / ${syncProgress.totalEntries}`,
@@ -23,6 +24,9 @@ export function formatSyncDescription(
         ? ` (${Math.round((storageStatus.storageUsedBytes / storageStatus.storageLimitBytes) * 100)}%)`
         : "";
     parts.push(`Storage: ${storageLabel}${percent}`);
+  }
+  if (lastVerifiedLabel) {
+    parts.push(lastVerifiedLabel);
   }
 
   return parts.join(" - ");

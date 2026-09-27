@@ -12,6 +12,7 @@ export type OsyncSyncState =
   | "not_ready"
   | "syncing"
   | "reconnecting"
+  | "checking"
   | "up_to_date"
   | "attention_needed";
 

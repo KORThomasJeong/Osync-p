@@ -24,17 +24,35 @@ import {
   type SyncEngineEntryVersionsPage,
 } from "./engine";
 import { UserVisibleSyncStatusTracker } from "./user-visible-status-tracker";
+import {
+  describeActivityError,
+  SyncActivityLog,
+  type SyncActivityEntry,
+  type SyncActivityLogStorage,
+} from "./activity-log";
 import type {
   UserVisibleSyncProgress,
   UserVisibleSyncState,
 } from "./user-visible-status";
 
 export type { InitialCollisionPreview } from "./engine";
+export type { SyncActivityEntry, SyncActivityLogStorage } from "./activity-log";
 
 export type {
   ConflictQueueItem,
   ConflictQueueSource,
 } from "./conflict-queue";
+
+// Startup retry after a transient failure (e.g. launched offline). Connectivity
+// events also retry, but a device that stays in the foreground may never fire one.
+const STARTUP_RETRY_BASE_DELAY_MS = 5_000;
+const STARTUP_RETRY_MAX_DELAY_MS = 60_000;
+// Window focus fires resume constantly on desktop; the local scan only needs to
+// catch edits made outside Obsidian while it was backgrounded.
+const RESUME_RECONCILE_MIN_INTERVAL_MS = 30_000;
+// flushPendingNow runs while the app is being hidden; don't hold the caller longer
+// than the OS is likely to keep us alive. The push itself keeps going in the background.
+const FLUSH_MAX_WAIT_MS = 10_000;
 
 export interface MassDeleteGuardEvent {
   deleteCount: number;
@@ -54,12 +72,17 @@ export interface SyncControllerDeps {
   notify?: (message: string, timeout?: number) => void;
   notifyMassDeleteGuard?: (event: MassDeleteGuardEvent) => void;
   onStatusChange?: () => void;
+  // Persists the sync activity log across restarts; in-memory only when omitted.
+  activityLogStorage?: SyncActivityLogStorage;
 }
 
 export class SyncController {
   private readonly statusTracker = new UserVisibleSyncStatusTracker(() =>
     this.deps.onStatusChange?.(),
   );
+  private readonly activityLog = new SyncActivityLog({
+    storage: this.deps.activityLogStorage,
+  });
   private readonly syncEngine = new SyncEngine({
     plugin: this.deps.plugin,
     getApiBaseUrl: () => this.deps.getApiBaseUrl(),
@@ -74,8 +97,14 @@ export class SyncController {
     setSyncProgress: (progress) => this.statusTracker.setProgress(progress),
     setSyncStatus: (status) => this.statusTracker.setStatus(status),
     setStorageStatus: (status) => this.statusTracker.setStorageStatus(status),
+    recordActivity: (kind, message) => this.activityLog.record(kind, message),
   });
   private readonly conflictQueue = new SyncConflictQueue();
+  private startupRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private startupRetryAttempt = 0;
+  // Mirrors the user's pause so a startup retry that starts the loop re-applies it.
+  private autoSyncPaused = false;
+  private lastReconcileAt: number | null = null;
 
   constructor(private readonly deps: SyncControllerDeps) {}
 
@@ -108,8 +137,99 @@ export class SyncController {
   }
 
   async stop(): Promise<void> {
+    this.cancelStartupRetry();
     this.syncEngine.stopAutoSync();
+    this.activityLog.flush();
     await this.syncEngine.closeStore();
+  }
+
+  // Newest last.
+  getActivityLog(): readonly SyncActivityEntry[] {
+    return this.activityLog.getEntries();
+  }
+
+  onActivityLogChange(listener: () => void): () => void {
+    return this.activityLog.onChange(listener);
+  }
+
+  clearActivityLog(): void {
+    this.activityLog.clear();
+  }
+
+  // Count of local changes recorded but not yet accepted by the server.
+  async getPendingUploadCount(): Promise<number> {
+    try {
+      return await this.syncEngine.countPendingMutations();
+    } catch (error) {
+      console.warn("[osync] failed to count pending uploads", error);
+      return 0;
+    }
+  }
+
+  // The app is being hidden (mobile backgrounding, window blur): push queued local
+  // edits now instead of after the debounce, since the OS may suspend us first.
+  // Resolves within FLUSH_MAX_WAIT_MS even if the push is still running.
+  async flushPendingNow(): Promise<void> {
+    try {
+      await this.syncEngine.waitForLocalMutationWork();
+      const pending = await this.syncEngine.countPendingMutations();
+      if (pending === 0 || this.autoSyncPaused || !this.syncEngine.isAutoSyncStarted()) {
+        return;
+      }
+
+      this.activityLog.record("flush", `Flushing ${pending} pending uploads`);
+      await waitAtMost(this.syncEngine.flushPendingPush(), FLUSH_MAX_WAIT_MS);
+    } catch (error) {
+      this.activityLog.record("error", `Flush failed: ${describeActivityError(error)}`);
+    } finally {
+      this.activityLog.flush();
+    }
+  }
+
+  // User-requested full verification: like a resume (ping, reconnect if dead,
+  // catch-up pull) but with a fresh local scan and fresh backoffs. Never throws;
+  // failures show up in the sync status and the activity log.
+  async checkNow(): Promise<void> {
+    if (!this.deps.hasActiveRemoteVaultSession() || !this.deps.hasAuthenticatedSession()) {
+      return;
+    }
+
+    try {
+      if (
+        !this.syncEngine.hasStore() ||
+        this.startupRetryTimer !== null ||
+        !this.syncEngine.isAutoSyncStarted()
+      ) {
+        this.activityLog.record("resume", "Manual check: starting sync");
+        this.cancelStartupRetry();
+        await this.ensureAutoSyncState();
+        return;
+      }
+      if (this.autoSyncPaused) {
+        this.activityLog.record("resume", "Manual check skipped: sync is paused");
+        return;
+      }
+
+      this.activityLog.record("resume", "Manual check");
+      if (this.statusTracker.getState() !== "attention_needed") {
+        // An escalated failure stays visible until the check actually succeeds.
+        this.statusTracker.setStatus("checking");
+      }
+      this.lastReconcileAt = null;
+      if (!(await this.reconcileAfterResume())) {
+        return;
+      }
+      const started = await this.syncEngine.startAutoSync();
+      if (!started) {
+        await this.syncEngine.resumeAutoSyncConnection();
+      }
+    } catch (error) {
+      this.activityLog.record("error", `Manual check failed: ${describeActivityError(error)}`);
+      this.statusTracker.setStatus("attention_needed");
+      this.deps.notifyError(error, "Sync check failed");
+    } finally {
+      this.activityLog.flush();
+    }
   }
 
   async readLocalVaultId(): Promise<string> {
@@ -121,6 +241,7 @@ export class SyncController {
   }
 
   stopAutoSyncAndMarkNotReady(): void {
+    this.cancelStartupRetry();
     this.syncEngine.stopAutoSync();
     this.statusTracker.setStorageStatus(null);
     this.statusTracker.setProgress({
@@ -139,14 +260,27 @@ export class SyncController {
   }
 
   pauseAutoSync(): void {
+    this.autoSyncPaused = true;
     this.syncEngine.pauseAutoSync();
   }
 
   resumeAutoSyncFromPause(): void {
+    this.autoSyncPaused = false;
     this.syncEngine.resumeAutoSyncFromPause();
+    // Edits made while paused were recorded but never scheduled (notifyLocalChange
+    // is a no-op while paused), so they would otherwise wait for the next edit.
+    void this.syncEngine.hasPendingMutations().then(
+      (hasPendingMutations) => {
+        if (hasPendingMutations) {
+          this.syncEngine.notifyLocalChange();
+        }
+      },
+      () => {},
+    );
   }
 
   async resetLocalSyncState(opts?: { preserveLocalVaultId?: boolean }): Promise<void> {
+    this.cancelStartupRetry();
     this.syncEngine.stopAutoSync();
     // Let any in-flight pull/push and queued local work settle before detaching and
     // deleting the store, so nothing keeps writing to a store being torn down.
@@ -186,6 +320,12 @@ export class SyncController {
     return this.statusTracker.getStorageStatus();
   }
 
+  // When the server cursor was last confirmed (completed pull or a hello that was
+  // not ahead); null before the first confirmation. For "last checked N min ago".
+  getLastVerifiedAt(): number | null {
+    return this.syncEngine.getLastVerifiedAt();
+  }
+
   getMaxFileSizeBytes(): number {
     return this.syncEngine.getMaxFileSizeBytes();
   }
@@ -199,7 +339,10 @@ export class SyncController {
   }
 
   async ensureAutoSyncState(): Promise<void> {
+    // This attempt supersedes any scheduled retry; a failure below reschedules it.
+    this.clearStartupRetryTimer();
     if (!this.deps.hasActiveRemoteVaultSession() || !this.deps.hasAuthenticatedSession()) {
+      this.cancelStartupRetry();
       this.syncEngine.stopAutoSync();
       this.statusTracker.setStorageStatus(null);
       this.statusTracker.setProgress({
@@ -213,8 +356,14 @@ export class SyncController {
     try {
       await this.syncEngine.runInitialPullIfRequired();
       const reconcile = await this.syncEngine.reconcileOnce();
+      this.lastReconcileAt = Date.now();
+      this.recordScan("Startup scan", reconcile);
       await this.syncEngine.waitForLocalMutationWork();
       await this.syncEngine.startAutoSync();
+      this.startupRetryAttempt = 0;
+      if (this.autoSyncPaused) {
+        this.syncEngine.pauseAutoSync();
+      }
       const hasPendingMutations = await this.syncEngine.hasPendingMutations();
       if (
         hasPendingMutations ||
@@ -225,21 +374,69 @@ export class SyncController {
       }
     } catch (error) {
       if (error instanceof MassDeleteGuardError) {
+        this.cancelStartupRetry();
         this.handleMassDeleteGuard(error);
         return;
       }
       const classification = classifyReconnectError(error);
       if (classification.kind === "transient") {
-        // Likely offline at startup; connectivity events will retry quietly.
+        // Likely offline at startup; retry quietly with backoff (connectivity
+        // events may also retry sooner).
         this.statusTracker.setStatus("reconnecting");
+        this.scheduleStartupRetry();
         return;
       }
+      this.cancelStartupRetry();
       this.statusTracker.setStatus("attention_needed");
       this.deps.notifyError(error, "Auto sync initialization failed");
     }
   }
 
+  private scheduleStartupRetry(): void {
+    if (this.startupRetryTimer !== null) {
+      return;
+    }
+
+    const delay = Math.min(
+      STARTUP_RETRY_BASE_DELAY_MS * 2 ** this.startupRetryAttempt,
+      STARTUP_RETRY_MAX_DELAY_MS,
+    );
+    this.startupRetryAttempt += 1;
+    this.startupRetryTimer = setTimeout(() => {
+      this.startupRetryTimer = null;
+      void this.ensureAutoSyncState();
+    }, delay);
+  }
+
+  private clearStartupRetryTimer(): void {
+    if (this.startupRetryTimer === null) {
+      return;
+    }
+
+    clearTimeout(this.startupRetryTimer);
+    this.startupRetryTimer = null;
+  }
+
+  private cancelStartupRetry(): void {
+    this.clearStartupRetryTimer();
+    this.startupRetryAttempt = 0;
+  }
+
+  private recordScan(
+    label: string,
+    result: { filesScanned: number; filesQueuedForUpsert: number; filesQueuedForDelete: number },
+  ): void {
+    this.activityLog.record(
+      "scan",
+      `${label}: ${result.filesQueuedForUpsert} upserts, ${result.filesQueuedForDelete} deletes queued (${result.filesScanned} scanned)`,
+    );
+  }
+
   private handleMassDeleteGuard(error: MassDeleteGuardError): void {
+    this.activityLog.record(
+      "error",
+      `Mass delete guard: ${error.deleteCount} of ${error.knownEntryCount} entries would be deleted`,
+    );
     this.statusTracker.setStatus("attention_needed");
     this.deps.notifyMassDeleteGuard?.({
       deleteCount: error.deleteCount,
@@ -330,8 +527,20 @@ export class SyncController {
       return;
     }
 
-    if (!this.syncEngine.hasStore()) {
+    if (!this.syncEngine.hasStore() || this.startupRetryTimer !== null) {
+      // Startup never completed (initial pull / reconcile included): run it in full.
       await this.ensureAutoSyncState();
+      return;
+    }
+
+    if (!this.autoSyncPaused && this.statusTracker.getState() === "up_to_date") {
+      // Stale until this resume re-checks the server; don't keep claiming it.
+      this.statusTracker.setStatus("checking");
+    }
+    // Scan before resuming the connection so edits made outside Obsidian while
+    // backgrounded are pending mutations by the time the catch-up pull runs; the
+    // pull then treats them as local conflicts instead of overwriting them.
+    if (!(await this.reconcileAfterResume())) {
       return;
     }
 
@@ -339,6 +548,34 @@ export class SyncController {
     if (!started) {
       await this.syncEngine.resumeAutoSyncConnection();
     }
+  }
+
+  // Returns false when the mass-delete guard tripped and the resume should stop.
+  private async reconcileAfterResume(): Promise<boolean> {
+    const now = Date.now();
+    if (
+      this.lastReconcileAt !== null &&
+      now - this.lastReconcileAt < RESUME_RECONCILE_MIN_INTERVAL_MS
+    ) {
+      return true;
+    }
+
+    try {
+      const reconcile = await this.syncEngine.reconcileOnce();
+      this.lastReconcileAt = now;
+      this.recordScan("Resume scan", reconcile);
+      if (reconcile.filesQueuedForUpsert > 0 || reconcile.filesQueuedForDelete > 0) {
+        this.syncEngine.notifyLocalChange();
+      }
+    } catch (error) {
+      if (error instanceof MassDeleteGuardError) {
+        this.handleMassDeleteGuard(error);
+        return false;
+      }
+      this.activityLog.record("error", `Local scan failed: ${describeActivityError(error)}`);
+      this.deps.notifyError(error, "Local change scan failed");
+    }
+    return true;
   }
 
   registerVaultEvents(): void {
@@ -455,5 +692,19 @@ export class SyncController {
     this.notify(
       `Sync conflict detected for "${event.originalPath}". The remote version will be kept. Open "Sync conflicts" to review.`,
     );
+  }
+}
+
+async function waitAtMost(work: Promise<void>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  try {
+    await Promise.race([work, timeout]);
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
   }
 }

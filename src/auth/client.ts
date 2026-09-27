@@ -1,4 +1,4 @@
-import { requestUrl } from "obsidian";
+import { requestUrlWithTimeout } from "../http/request";
 
 export const DEVICE_AUTH_CLIENT_ID = "osync-obsidian-plugin";
 
@@ -81,7 +81,7 @@ type SessionResponse = {
 
 export class AuthClient {
   async startDeviceAuthorization(apiBaseUrl: string): Promise<DeviceAuthorizationStart> {
-    const response = await requestUrl({
+    const response = await requestUrlWithTimeout({
       url: `${stripTrailingSlash(apiBaseUrl)}/api/auth/device/code`,
       method: "POST",
       headers: {
@@ -126,7 +126,7 @@ export class AuthClient {
     apiBaseUrl: string,
     deviceCode: string,
   ): Promise<DeviceAuthorizationPollResult> {
-    const response = await requestUrl({
+    const response = await requestUrlWithTimeout({
       url: `${stripTrailingSlash(apiBaseUrl)}/api/auth/device/token`,
       method: "POST",
       throw: false,
@@ -199,7 +199,7 @@ export class AuthClient {
     apiBaseUrl: string,
     sessionToken: string,
   ): Promise<AuthenticatedUserSession | null> {
-    const response = await requestUrl({
+    const response = await requestUrlWithTimeout({
       url: `${stripTrailingSlash(apiBaseUrl)}/api/auth/get-session`,
       method: "GET",
       throw: false,
@@ -230,7 +230,7 @@ export class AuthClient {
   }
 
   async signOut(apiBaseUrl: string, sessionToken: string): Promise<void> {
-    await requestUrl({
+    await requestUrlWithTimeout({
       url: `${stripTrailingSlash(apiBaseUrl)}/api/auth/sign-out`,
       method: "POST",
       throw: false,

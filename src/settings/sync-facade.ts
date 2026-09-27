@@ -21,6 +21,8 @@ export interface OsyncSyncFacade {
   getSyncPercent(): number;
   getSyncProgress(): OsyncSyncProgress;
   getStorageStatus(): OsyncStorageStatus | null;
+  // When sync last confirmed it was caught up with the server; null if never.
+  getLastVerifiedAt?(): number | null;
   watchStorageStatus(): void;
   unwatchStorageStatus(): void;
   getSyncFileRules(): OsyncFileRules;

@@ -84,6 +84,13 @@ export class SyncAutoLoopState {
     this.set("paused");
   }
 
+  resumeFromPause(): void {
+    if (this.state !== "paused") {
+      throw new Error(`Invalid transition: ${this.state} → live`);
+    }
+    this.set("live");
+  }
+
   stop(): void {
     this.set("stopped");
   }

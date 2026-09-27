@@ -1,4 +1,5 @@
 import {
+  BLOB_TRANSFER_TIMEOUT_MS,
   defaultHttpClient,
   extractErrorMessage,
   stripTrailingSlash,
@@ -47,6 +48,7 @@ export class SyncPullClient {
         const { response } = await this.httpClient.request({
           path: () =>
             `/v1/vaults/${encodeURIComponent(vaultId)}/blobs/${encodeURIComponent(blobId)}`,
+          timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
         });
         return this.readDownloadResponse(response);
       }
@@ -63,6 +65,7 @@ export class SyncPullClient {
       const getResponse = await this.fallbackHttpClient.request({
         url,
         method: "GET",
+        timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
       });
       return this.readDownloadResponse(getResponse);
     }
@@ -82,6 +85,7 @@ export class SyncPullClient {
         headers: {
           authorization: `Bearer ${syncToken}`,
         },
+        timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
       });
       return this.readDownloadResponse(response);
     }
@@ -98,6 +102,7 @@ export class SyncPullClient {
     const getResponse = await this.fallbackHttpClient.request({
       url,
       method: "GET",
+      timeoutMs: BLOB_TRANSFER_TIMEOUT_MS,
     });
     return this.readDownloadResponse(getResponse);
   }

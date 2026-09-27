@@ -71,13 +71,26 @@ type PendingRequest = {
   resolve(message: ServerMessage): void;
   reject(error: Error): void;
   timeout: ReturnType<typeof setTimeout> | null;
+  // Requests whose response advances the server cursor on our behalf.
+  mutating: boolean;
 };
+
+function isMutatingRequest(message: RequestClientMessage): boolean {
+  return message.type === "commit_mutations" || message.type === "restore_entry_version";
+}
 
 export class SyncRealtimeSocketSession {
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
   private nextRequestId = 0;
+  // Highest server cursor this session knows it has been told about: hello,
+  // cursor_advanced, cursor acks, and our own commits (only when they are
+  // contiguous with what we already knew). A heartbeat_ack reporting a higher
+  // cursor means a cursor_advanced broadcast was lost — typically while the OS
+  // suspended the app with the socket still open — so we replay it locally.
+  private knownServerCursor: number | null = null;
+  private pendingMutatingRequests = 0;
 
   constructor(
     private readonly socket: WebSocket,
@@ -143,7 +156,11 @@ export class SyncRealtimeSocketSession {
               );
             }, timeoutMs)
           : null;
-      this.pendingRequests.set(message.requestId, { resolve, reject, timeout });
+      const mutating = isMutatingRequest(message);
+      if (mutating) {
+        this.pendingMutatingRequests += 1;
+      }
+      this.pendingRequests.set(message.requestId, { resolve, reject, timeout, mutating });
       try {
         this.socket.send(JSON.stringify(message));
       } catch (error) {
@@ -200,6 +217,7 @@ export class SyncRealtimeSocketSession {
     }
 
     if (parsed.type === "cursor_advanced") {
+      this.noteKnownCursor(parsed.cursor);
       this.callbacks.onCursorAdvanced(parsed.cursor);
       return;
     }
@@ -226,6 +244,8 @@ export class SyncRealtimeSocketSession {
 
     this.pendingRequests.delete(parsed.requestId);
     this.clearPendingTimeout(request);
+    this.settleMutating(request);
+    this.trackCursorFromResponse(parsed);
     if (
       parsed.type === "commit_rejected" ||
       parsed.type === "commit_mutations_failed" ||
@@ -239,6 +259,91 @@ export class SyncRealtimeSocketSession {
 
     request.resolve(parsed);
   };
+
+  private trackCursorFromResponse(message: ServerMessage): void {
+    switch (message.type) {
+      case "hello_ack":
+      case "cursor_acked":
+        this.noteKnownCursor(message.cursor);
+        return;
+      case "commit_mutations_committed":
+        // Our own commits are not broadcast back to us. Fold them in only when
+        // they extend the known cursor without a gap: a gap means another
+        // device committed in between and we never heard about it, which is
+        // exactly what the heartbeat check should catch. The batch-level
+        // `cursor` is ignored — with no accepted results it is the vault's
+        // current cursor, which could mask a missed broadcast.
+        this.foldOwnCommitCursors(
+          message.results.flatMap((result) =>
+            result.status === "accepted" ? [result.cursor] : [],
+          ),
+        );
+        return;
+      case "commit_accepted":
+      case "entry_version_restored":
+        this.foldOwnCommitCursors([message.cursor]);
+        return;
+      case "heartbeat_ack":
+        this.checkHeartbeatCursor(message.cursor);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private checkHeartbeatCursor(cursor: number | undefined): void {
+    if (typeof cursor !== "number" || !Number.isFinite(cursor)) {
+      // Older server without heartbeat cursors.
+      return;
+    }
+    if (this.knownServerCursor === null) {
+      this.knownServerCursor = cursor;
+      return;
+    }
+    if (this.pendingMutatingRequests > 0) {
+      // Our own in-flight commit may already be reflected in the server cursor
+      // before its response reaches us. Re-evaluate on the next heartbeat.
+      return;
+    }
+    if (cursor <= this.knownServerCursor) {
+      this.callbacks.onServerCursorConfirmed?.(cursor);
+      return;
+    }
+    this.knownServerCursor = cursor;
+    this.callbacks.onCursorAdvanced(cursor);
+  }
+
+  private foldOwnCommitCursors(cursors: number[]): void {
+    if (this.knownServerCursor === null) {
+      return;
+    }
+    const sorted = [...cursors].sort((a, b) => a - b);
+    for (const cursor of sorted) {
+      if (cursor <= this.knownServerCursor) {
+        continue;
+      }
+      if (cursor !== this.knownServerCursor + 1) {
+        return;
+      }
+      this.knownServerCursor = cursor;
+    }
+  }
+
+  private noteKnownCursor(cursor: number): void {
+    if (typeof cursor !== "number" || !Number.isFinite(cursor)) {
+      return;
+    }
+    if (this.knownServerCursor === null || cursor > this.knownServerCursor) {
+      this.knownServerCursor = cursor;
+    }
+  }
+
+  private settleMutating(request: PendingRequest): void {
+    if (request.mutating) {
+      request.mutating = false;
+      this.pendingMutatingRequests = Math.max(0, this.pendingMutatingRequests - 1);
+    }
+  }
 
   private readonly handleError = (): void => {
     this.failConnection(new Error("sync websocket connection failed"));
@@ -301,6 +406,7 @@ export class SyncRealtimeSocketSession {
     this.pendingRequests.clear();
     for (const request of pending) {
       this.clearPendingTimeout(request);
+      this.settleMutating(request);
       request.reject(error);
     }
   }

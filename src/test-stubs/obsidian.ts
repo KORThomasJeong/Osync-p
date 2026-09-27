@@ -312,8 +312,32 @@ export class Setting {
   }
 }
 
+const createdNotices: string[] = [];
+
 export class Notice {
-  constructor(_message: string) {}
+  constructor(message: string, _timeout?: number) {
+    createdNotices.push(message);
+  }
+}
+
+export function getCreatedNotices(): string[] {
+  return [...createdNotices];
+}
+
+const missingIconIds = new Set<string>();
+
+export function setMissingIconIds(ids: string[]): void {
+  missingIconIds.clear();
+  for (const id of ids) missingIconIds.add(id);
+}
+
+export function getIcon(iconId: string): object | null {
+  return missingIconIds.has(iconId) ? null : {};
+}
+
+// Records the icon on the element so tests can assert it via `el.iconId`.
+export function setIcon(parent: unknown, iconId: string): void {
+  (parent as { iconId?: string }).iconId = iconId;
 }
 
 export function setRequestUrlMock(mock: RequestUrlMock): void {
@@ -362,6 +386,8 @@ export function resetObsidianMocks(): void {
   createdElementTexts.length = 0;
   settingNames.length = 0;
   settingDescriptions.length = 0;
+  createdNotices.length = 0;
+  missingIconIds.clear();
 }
 
 export async function requestUrl(input: unknown): Promise<unknown> {

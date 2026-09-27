@@ -15,6 +15,7 @@ export interface OsyncCommandController {
   changeVaultPasswordFromPrompt(): Promise<void>;
   openVersionHistoryPane(): Promise<void>;
   openConflictResolutionPane(): Promise<void>;
+  openSyncStatus(): void;
   isSyncPaused(): boolean;
   toggleSyncPause(): Promise<void>;
   resetLocalSyncStateInPlace(): Promise<void>;
@@ -105,6 +106,15 @@ export function registerOsyncCommands(
     name: "Open version history",
     callback: async () => {
       await controller.openVersionHistoryPane();
+    },
+  });
+
+  plugin.addCommand({
+    id: "open-sync-status",
+    name: "Open sync status",
+    icon: "refresh-cw",
+    callback: () => {
+      controller.openSyncStatus();
     },
   });
 

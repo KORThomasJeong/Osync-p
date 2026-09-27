@@ -6,6 +6,7 @@ import type { OsyncAuthFacade } from "../auth-facade";
 import type { OsyncSyncFacade } from "../sync-facade";
 import type { OsyncVaultFacade } from "../vault-facade";
 import { formatSyncDescription, shouldShowSyncSpinner } from "./format";
+import { formatLastVerifiedLabel } from "../../sync/runtime/user-visible-status";
 import { openResetLocalSyncConfirmModal } from "../../plugin/reset-local-sync-modal";
 import { ConflictCleanupModal, DeletedFilesModal, ExcludedFoldersModal } from "./modals";
 
@@ -63,12 +64,16 @@ export function renderSyncStatusSetting(
   controller: OsyncSyncFacade,
 ): void {
   const syncProgress = controller.getSyncProgress();
+  const lastVerifiedLabel = controller.getLastVerifiedAt
+    ? formatLastVerifiedLabel(controller.getLastVerifiedAt())
+    : null;
   const syncSetting = new Setting(containerEl)
     .setName("Sync")
     .setDesc(formatSyncDescription(
       controller.getSyncStatusLabel(),
       syncProgress,
       controller.getStorageStatus(),
+      lastVerifiedLabel,
     ));
   if (shouldShowSyncSpinner(controller.getSyncState())) {
     syncSetting.addExtraButton((button) => {

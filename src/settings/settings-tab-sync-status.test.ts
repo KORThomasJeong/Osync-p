@@ -93,6 +93,37 @@ describe("OsyncSettingTab sync status", () => {
     expect(getExtraButtonComponents()).toHaveLength(1);
   });
 
+  it("shows a spinner while a resume re-checks the server", () => {
+    const tab = createSettingsTab({
+      hasAuthenticatedSession: () => true,
+      getSyncState: () => "checking",
+      getSyncStatusLabel: () => "Sync: checking 100%",
+    });
+
+    tab.display();
+
+    expect(getExtraButtonComponents()).toHaveLength(1);
+  });
+
+  it("shows when the server was last checked", () => {
+    const tab = createSettingsTab({
+      hasAuthenticatedSession: () => true,
+      getSyncState: () => "up_to_date",
+      getSyncStatusLabel: () => "Sync: up to date 100%",
+      getSyncProgress: () => ({
+        completedEntries: 12,
+        totalEntries: 12,
+      }),
+      getLastVerifiedAt: () => Date.now() - 5 * 60_000,
+    });
+
+    tab.display();
+
+    expect(getSettingDescriptions()[0]).toBe(
+      "Sync: up to date 100% - 12 / 12 - Last server check: 5 min ago",
+    );
+  });
+
   it("hides the sync spinner when sync is idle", () => {
     const tab = createSettingsTab({
       hasAuthenticatedSession: () => true,
