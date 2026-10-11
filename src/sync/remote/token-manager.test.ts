@@ -162,6 +162,47 @@ describe("SyncTokenManager", () => {
     expect(issueSyncToken).toHaveBeenCalledTimes(2);
   });
 
+  it("sends the active key fingerprint so the server can refuse a wrong key", async () => {
+    const issueSyncToken = vi.fn(async (): Promise<SyncTokenResponse> => ({
+      token: "t",
+      expiresAt: 1_120,
+      vaultId: "vault-1",
+      localVaultId: "local-vault-1",
+    }));
+    const manager = createManager({
+      getKeyFingerprint: async () => "fp-a",
+      syncAccessClient: { issueSyncToken } as SyncAccessClient,
+    });
+
+    await manager.getTokenForActiveRemoteVault();
+
+    expect(issueSyncToken).toHaveBeenCalledWith("http://127.0.0.1:8787", "session-token", {
+      vaultId: "vault-1",
+      localVaultId: "local-vault-1",
+      keyFingerprint: "fp-a",
+    });
+  });
+
+  it("does not reuse a token issued for a different key", async () => {
+    let fingerprint = "fp-old";
+    const issueSyncToken = vi.fn(async (): Promise<SyncTokenResponse> => ({
+      token: "t",
+      expiresAt: 1_120,
+      vaultId: "vault-1",
+      localVaultId: "local-vault-1",
+    }));
+    const manager = createManager({
+      getKeyFingerprint: async () => fingerprint,
+      syncAccessClient: { issueSyncToken } as SyncAccessClient,
+    });
+
+    await manager.getTokenForActiveRemoteVault();
+    fingerprint = "fp-new";
+    await manager.getTokenForActiveRemoteVault();
+
+    expect(issueSyncToken).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects when there is no auth session", async () => {
     const manager = createManager({
       getAuthSessionToken: () => " ",
@@ -199,6 +240,7 @@ function createManager(
     getAuthSessionToken: () => string;
     getRemoteVaultId: () => string | null;
     getLocalVaultId: () => Promise<string>;
+    getKeyFingerprint: () => Promise<string | null>;
     syncAccessClient: SyncAccessClient;
     now: () => number;
   }> = {},
@@ -208,6 +250,7 @@ function createManager(
     getAuthSessionToken: overrides.getAuthSessionToken ?? (() => "session-token"),
     getRemoteVaultId: overrides.getRemoteVaultId ?? (() => "vault-1"),
     getLocalVaultId: overrides.getLocalVaultId ?? (async () => "local-vault-1"),
+    getKeyFingerprint: overrides.getKeyFingerprint,
     syncAccessClient: overrides.syncAccessClient,
     now: overrides.now ?? (() => 1_000_000),
   });

@@ -1,4 +1,5 @@
 import { isPathWithinSyncLimits } from "./path-limits";
+import type { DevicePathPolicy } from "./path-portability";
 
 const IMAGE_EXTENSIONS = new Set([
   "png",
@@ -72,17 +73,35 @@ export function normalizeSyncFileRules(value: unknown): SyncFileRules {
   };
 }
 
-export function shouldSyncPath(path: string, rules: SyncFileRules): boolean {
+// Whether this device syncs `path`: the user's rules AND the device can hold the path.
+// A path the device cannot hold (too long, a Windows-invalid name, a write that failed
+// here) is treated exactly like an excluded one — no disk I/O, no upload, and no delete
+// propagated for its absence. Without a device policy only the default path limits apply.
+export function shouldSyncPath(
+  path: string,
+  rules: SyncFileRules,
+  device?: DevicePathPolicy,
+): boolean {
+  if (!matchesSyncFileRules(path, rules)) {
+    return false;
+  }
+
+  const normalizedPath = normalizeVaultPath(path);
+  return device
+    ? device.describeUnwritable(normalizedPath) === null
+    : isPathWithinSyncLimits(normalizedPath);
+}
+
+// The user-configured rules only (file types, excluded folders, config files) with no
+// device-specific checks. Use this where the answer must be the same on every device,
+// e.g. deciding which server entries to purge.
+export function matchesSyncFileRules(path: string, rules: SyncFileRules): boolean {
   const normalizedPath = normalizeVaultPath(path);
   if (!normalizedPath) {
     return false;
   }
 
   if (isSyncConflictFile(normalizedPath)) {
-    return false;
-  }
-
-  if (!isPathWithinSyncLimits(normalizedPath)) {
     return false;
   }
 

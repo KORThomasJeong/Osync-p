@@ -44,4 +44,13 @@ describe("findExcludedRemoteEntries", () => {
     const states = [remote({ entryId: "a", path: "Wiki/_retrieval/x.md" })];
     expect(findExcludedRemoteEntries(states, DEFAULT_SYNC_FILE_RULES)).toEqual([]);
   });
+
+  it("never selects entries that are only unwritable on this device (path limits, Windows names)", () => {
+    const states = [
+      remote({ entryId: "long", path: `Notes/${"가".repeat(85)}.md` }),
+      remote({ entryId: "win", path: "2026/260719 너희는 나를 누구라 하느냐?.md" }),
+      remote({ entryId: "drop", path: "Wiki/_retrieval/doc.md" }),
+    ];
+    expect(findExcludedRemoteEntries(states, rules).map((s) => s.entryId)).toEqual(["drop"]);
+  });
 });

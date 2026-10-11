@@ -35,14 +35,18 @@ import {
 import { normalizeExcludedFolders, type SyncFileRules } from "../sync/core/file-rules";
 import type { SyncTokenResponse } from "../sync/remote/client";
 import { createVaultLocalActivityLogStorage } from "../sync/runtime/activity-log";
+import {
+  createVaultLocalUnwritablePathsStorage,
+  UNREADABLE_ENTRIES_STORAGE_KEY,
+} from "../sync/runtime/device-sync-issues";
 import { SyncController } from "../sync/runtime/controller";
 import { VaultKeyCryptoService } from "../sync/core/crypto-service";
 import { SyncTokenManager } from "../sync/remote/token-manager";
 import { readLocalVaultId } from "../sync/store/dexie/local-vault";
 import type { StoredRemoteVaultKeySecret } from "../remote-vault/device-storage";
 import {
-  clearStoredRemoteVaultKeySecret,
-  readStoredRemoteVaultKeySecret,
+  readRemoteVaultKeySecretForVault,
+  releaseRemoteVaultKeySecret,
   writeStoredRemoteVaultKeySecret,
 } from "../remote-vault/device-storage";
 import { RemoteVaultManager } from "../remote-vault/manager";
@@ -50,7 +54,11 @@ import {
   readCachedRemoteVaultSummary,
   writeCachedRemoteVaultSummary,
 } from "../remote-vault/summary-cache";
-import { RemoteVaultPasswordChangedError } from "../remote-vault/types";
+import {
+  RemoteVaultKeyMismatchError,
+  RemoteVaultPasswordChangedError,
+} from "../remote-vault/types";
+import { VerifyVaultKeyModal, type VaultKeyVerificationSource } from "./verify-vault-key-modal";
 import type { SyncConnection } from "../sync/store/store";
 
 export interface OsyncPluginControllerDeps {
@@ -99,15 +107,13 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
     notify: (message) => {
       new Notice(message);
     },
-    getCachedRemoteVaultSummary: () => {
-      const cached = readCachedRemoteVaultSummary(this.pluginDataStore);
-      return cached
-        ? { vaultName: cached.vaultName, activeKeyVersion: cached.activeKeyVersion }
-        : null;
-    },
+    getCachedRemoteVaultSummary: () => readCachedRemoteVaultSummary(this.pluginDataStore),
     saveCachedRemoteVaultSummary: (summary) => {
       writeCachedRemoteVaultSummary(this.pluginDataStore, summary);
       void this.pluginDataStore.save();
+    },
+    onStoredKeyMismatch: (vaultId) => {
+      void this.handleVaultKeyMismatch(vaultId);
     },
   });
   private readonly syncTokenManager = new SyncTokenManager({
@@ -123,10 +129,19 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
       // ID is not available." while the store re-initializes.
       return readLocalVaultId(this.plugin);
     },
+    getKeyFingerprint: async () => await this.remoteVaultManager.getActiveKeyFingerprint(),
   });
   private readonly syncController = new SyncController({
     plugin: this.plugin,
     activityLogStorage: createVaultLocalActivityLogStorage(this.plugin),
+    unwritablePathsStorage: createVaultLocalUnwritablePathsStorage(this.plugin),
+    unreadableEntriesStorage: createVaultLocalUnwritablePathsStorage(
+      this.plugin,
+      UNREADABLE_ENTRIES_STORAGE_KEY,
+    ),
+    onVaultKeyMismatch: () => {
+      void this.handleServerKeyMismatch();
+    },
     getApiBaseUrl: () => this.getApiBaseUrl(),
     getSyncToken: async () => await this.getSyncTokenForActiveRemoteVault(),
     invalidateSyncToken: () => {
@@ -182,8 +197,11 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
   async initialize(): Promise<void> {
     await this.pluginDataStore.initialize();
     await this.initializeSettings();
-    this.storedRemoteVaultKeySecret = await readStoredRemoteVaultKeySecret(this.plugin);
     this.storedSyncConnection = await this.syncController.readStoredConnection();
+    const connectedVaultId = this.storedSyncConnection?.remoteVaultId ?? null;
+    this.storedRemoteVaultKeySecret = connectedVaultId
+      ? await readRemoteVaultKeySecretForVault(this.plugin, connectedVaultId)
+      : null;
     await this.authManager.initialize();
     await this.tryRestorePersistedRemoteVaultSession();
     this.registerStoreCorruptionListener();
@@ -524,6 +542,22 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
     this.syncController.clearActivityLog();
   }
 
+  getUnwritablePaths(): readonly { path: string; reason: string; at: number }[] {
+    return this.syncController.getUnwritablePaths();
+  }
+
+  getPortabilityWarnings(): readonly { path: string; reason: string }[] {
+    return this.syncController.getPortabilityWarnings();
+  }
+
+  onDeviceSyncIssuesChange(listener: () => void): () => void {
+    return this.syncController.onDeviceSyncIssuesChange(listener);
+  }
+
+  async retryUnwritablePaths(): Promise<void> {
+    await this.syncController.retryUnwritablePaths();
+  }
+
   // Best-effort push of pending local changes when the app is backgrounded
   // (iOS may suspend it right after). Silent: no notice on failure.
   flushSyncOnHide(): void {
@@ -622,16 +656,134 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
     }
   }
 
+  // Keys live in app-wide secret storage (shared by every local vault on the device),
+  // so each is stored under its own remote vault id; see device-storage.ts.
   private async saveStoredRemoteVaultKeySecret(
     vault: StoredRemoteVaultKeySecret | null,
   ): Promise<void> {
-    this.storedRemoteVaultKeySecret = vault;
+    const previous = this.storedRemoteVaultKeySecret;
     if (vault) {
-      await writeStoredRemoteVaultKeySecret(this.plugin, vault);
-    } else {
-      await clearStoredRemoteVaultKeySecret(this.plugin);
+      if (!vault.vaultId) {
+        throw new Error("internal: a vault key must be stored with its vault id");
+      }
+      await writeStoredRemoteVaultKeySecret(this.plugin, { ...vault, vaultId: vault.vaultId });
+      this.storedRemoteVaultKeySecret = vault;
+      this.refreshUi();
+      return;
+    }
+
+    this.storedRemoteVaultKeySecret = null;
+    const vaultId =
+      previous?.vaultId ??
+      this.remoteVaultManager.getRemoteVaultId() ??
+      this.storedSyncConnection?.remoteVaultId ??
+      null;
+    if (vaultId) {
+      await releaseRemoteVaultKeySecret(this.plugin, vaultId, previous);
     }
     this.refreshUi();
+  }
+
+  // --- Vault key verification ---
+
+  openVerifyVaultKey(): void {
+    new VerifyVaultKeyModal(this.plugin.app, this.createVaultKeyVerificationSource()).open();
+  }
+
+  getUnreadableEntryCount(): number {
+    return this.syncController.getUnreadableEntryCount();
+  }
+
+  private createVaultKeyVerificationSource(): VaultKeyVerificationSource {
+    return {
+      getVaultName: () => this.remoteVaultManager.getActiveSession()?.summary.vaultName ?? "",
+      getKeyFingerprints: async () => await this.readKeyFingerprints(),
+      scanUnreadableEntries: async (onProgress) =>
+        await this.syncController.scanUnreadableEntries(onProgress),
+      removeUnreadableEntries: async (targets) => {
+        // Re-verify right before deleting anything: removal is only safe with the
+        // vault's own key (a wrong key would see healthy entries as unreadable).
+        const fingerprints = await this.readKeyFingerprints();
+        if (!fingerprints.local || fingerprints.local !== fingerprints.server) {
+          throw new Error("This device's vault key could not be verified; nothing was removed.");
+        }
+        return await this.syncController.removeUnreadableEntries(targets);
+      },
+      reuploadLocalCopies: async (entryIds) =>
+        await this.syncController.reuploadUnreadableLocalEntries(entryIds),
+      reenterVaultPassword: () => {
+        void this.handleServerKeyMismatch();
+      },
+    };
+  }
+
+  private async readKeyFingerprints(): Promise<{ local: string | null; server: string | null }> {
+    const local = await this.remoteVaultManager.getActiveKeyFingerprint();
+    if (!local) {
+      return { local: null, server: null };
+    }
+    return { local, server: await this.remoteVaultManager.fetchServerKeyFingerprint() };
+  }
+
+  // The server refused this device's key, or the user chose to re-enter the password
+  // after a failed verification: drop the key, then ask for the vault password.
+  private async handleServerKeyMismatch(): Promise<void> {
+    const vaultId =
+      (await this.remoteVaultManager.rejectActiveVaultKey()) ??
+      this.storedSyncConnection?.remoteVaultId ??
+      null;
+    if (vaultId) {
+      await this.handleVaultKeyMismatch(vaultId);
+    }
+  }
+
+  private vaultKeyReentry: Promise<void> | null = null;
+
+  // The key stored for this vault is not its key. Sync stays stopped until the user
+  // re-enters the vault password; then this device's own entries that were encrypted
+  // with the wrong key (unreadable now) are re-uploaded from the local files.
+  private handleVaultKeyMismatch(vaultId: string): Promise<void> {
+    if (this.vaultKeyReentry) {
+      return this.vaultKeyReentry;
+    }
+    const run = async (): Promise<void> => {
+      this.syncTokenManager.clear();
+      this.syncController.stopAutoSyncAndMarkNotReady();
+      const reconnected = await this.remoteVaultController.promptVaultKeyReentry({ vaultId });
+      if (!reconnected) {
+        return;
+      }
+      this.syncTokenManager.clear();
+      await this.initializeSyncStoreForActiveRemoteVault();
+      await this.reuploadWrongKeyEntries();
+      await this.ensureAutoSyncState();
+    };
+    this.vaultKeyReentry = run()
+      .catch((error: unknown) => {
+        this.notifyError(error, "Vault key re-entry failed");
+      })
+      .finally(() => {
+        this.vaultKeyReentry = null;
+      });
+    return this.vaultKeyReentry;
+  }
+
+  private async reuploadWrongKeyEntries(): Promise<void> {
+    try {
+      const scan = await this.syncController.scanUnreadableEntries();
+      if (scan.knownLocally.length === 0) {
+        return;
+      }
+      const count = await this.syncController.reuploadUnreadableLocalEntries(scan.knownLocally);
+      if (count > 0) {
+        new Notice(
+          `Osync: ${count} local file${count === 1 ? "" : "s"} written with the wrong key will be uploaded again.`,
+        );
+      }
+    } catch (error) {
+      // Not fatal: "Verify vault key" can run the same repair later.
+      console.warn("[osync] vault key: re-upload of unreadable local entries failed", error);
+    }
   }
 
   private async tryRestorePersistedRemoteVaultSession(): Promise<void> {
@@ -639,6 +791,11 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
       await this.remoteVaultManager.restorePersistedRemoteVaultSession();
       await this.initializeSyncStoreForActiveRemoteVault();
     } catch (error) {
+      if (error instanceof RemoteVaultKeyMismatchError) {
+        // Not awaited: the prompt waits for the user and must not hold up plugin load.
+        void this.handleVaultKeyMismatch(error.vaultId);
+        return;
+      }
       if (error instanceof RemoteVaultPasswordChangedError) {
         const storedVaultId = this.storedSyncConnection?.remoteVaultId ?? null;
         if (storedVaultId) {

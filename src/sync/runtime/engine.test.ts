@@ -8,7 +8,10 @@ import { DEFAULT_SYNC_FILE_RULES } from "../core/file-rules";
 import type { SyncTokenResponse } from "../remote/client";
 import { createInitializedTestSyncStore } from "../../test-support/test-plugin";
 import { writeStoredSyncConnection } from "../store/connection";
+import type { PullDeviceIssueEvent } from "../engine/pull-entry-state-applier";
+import { DeviceSyncIssues } from "./device-sync-issues";
 import { SyncEngine } from "./engine";
+import { RemoteVaultKeyMismatchError } from "../../remote-vault/types";
 
 type VaultEventCallback = (...args: unknown[]) => void;
 
@@ -491,6 +494,383 @@ describe("SyncEngine", () => {
       expect(dirty.map((m) => m.entryId)).toEqual(["zombie"]);
       expect(dirty[0]?.op).toBe("delete");
 
+      await store.close();
+    });
+
+    it("never counts or purges entries that are only unwritable on this device", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8("body"));
+      const store = await createInitializedTestSyncStore(plugin);
+      for (const [entryId, path] of [
+        ["windows", "2026/260719 너희는 나를 누구라 하느냐?.md"],
+        ["long", `Notes/${"가".repeat(85)}.md`],
+        ["failed", "Notes/locked.md"],
+        ["zombie", "Wiki/_retrieval/doc.md"],
+      ] as const) {
+        await store.applyRemoteState({
+          entryId,
+          path,
+          revision: 1,
+          blobId: `b-${entryId}`,
+          hash: `h-${entryId}`,
+          deleted: false,
+          updatedAt: 1,
+        });
+      }
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: true } });
+      deviceSyncIssues.applyPullEvent({
+        kind: "write_failed",
+        entryId: "failed",
+        path: "Notes/locked.md",
+        reason: "EBUSY",
+      });
+      const engine = createEngine(plugin, {
+        deviceSyncIssues,
+        getSyncFileRules: () => ({
+          ...DEFAULT_SYNC_FILE_RULES,
+          excludedFolders: ["Wiki/_retrieval"],
+        }),
+      });
+      engine.setStore(store);
+
+      expect(await engine.countExcludedRemoteEntries()).toBe(1);
+      expect(await engine.purgeExcludedRemoteEntries()).toBe(1);
+      expect((await store.listDirtyEntries(10)).map((m) => m.entryId)).toEqual(["zombie"]);
+
+      await store.close();
+    });
+  });
+
+  describe("vault key problems", () => {
+    type KeyLoopDeps = {
+      onError?: (error: unknown) => void;
+      pullOnce: (session: unknown) => Promise<unknown>;
+    };
+    const loopOf = (engine: SyncEngine) =>
+      (engine as unknown as { syncAutoLoop: { deps: KeyLoopDeps; stop: () => void } }).syncAutoLoop;
+    const pullServiceOf = (engine: SyncEngine) =>
+      (engine as unknown as {
+        syncPullService: {
+          deps: {
+            onDecryptFailure: (entryId: string) => void;
+            onEntryDecrypted: (entryId: string) => void;
+          };
+          pullOnce: (session: unknown) => Promise<unknown>;
+        };
+      }).syncPullService;
+    const emptyPull = {
+      cursor: 3,
+      entriesApplied: 0,
+      filesWritten: 0,
+      filesDeleted: 0,
+      conflictsCreated: 0,
+    };
+
+    it("stops auto sync and asks for the password when the server refuses the key", () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const onVaultKeyMismatch = vi.fn();
+      const setSyncStatus = vi.fn();
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        onVaultKeyMismatch,
+        setSyncStatus,
+      });
+      const loop = loopOf(engine);
+      const stop = vi.spyOn(loop, "stop");
+
+      loop.deps.onError?.(new RemoteVaultKeyMismatchError("vault-1"));
+
+      expect(stop).toHaveBeenCalled();
+      expect(setSyncStatus).toHaveBeenLastCalledWith("attention_needed");
+      expect(onVaultKeyMismatch).toHaveBeenCalledTimes(1);
+    });
+
+    it("records undecryptable entries once per pull, coalesced, and persists them", async () => {
+      const notify = vi.fn();
+      const recordActivity = vi.fn();
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: false } });
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        notify,
+        recordActivity,
+        deviceSyncIssues,
+      });
+      const pull = pullServiceOf(engine);
+      vi.spyOn(pull, "pullOnce").mockImplementation(async () => {
+        pull.deps.onDecryptFailure("e1");
+        pull.deps.onDecryptFailure("e2");
+        pull.deps.onDecryptFailure("e2");
+        return emptyPull;
+      });
+
+      await loopOf(engine).deps.pullOnce({});
+
+      expect(deviceSyncIssues.getUnreadableEntryIds()).toEqual(["e1", "e2"]);
+      const keyMessages = recordActivity.mock.calls.filter(([, message]) =>
+        String(message).includes("can't be decrypted"),
+      );
+      expect(keyMessages).toEqual([["error", "2 entries can't be decrypted with this vault's key"]]);
+      expect(notify).toHaveBeenCalledTimes(1);
+
+      // Already known: no new log line or Notice on the next pull.
+      await loopOf(engine).deps.pullOnce({});
+      expect(notify).toHaveBeenCalledTimes(1);
+    });
+
+    it("clears an unreadable record when the entry later decrypts", () => {
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: false } });
+      deviceSyncIssues.noteUnreadableEntry("e1");
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        deviceSyncIssues,
+      });
+
+      pullServiceOf(engine).deps.onEntryDecrypted("e1");
+
+      expect(deviceSyncIssues.getUnreadableEntryCount()).toBe(0);
+    });
+  });
+
+  describe("device sync issues", () => {
+    const pullDepsOf = (engine: SyncEngine) =>
+      (engine as unknown as {
+        syncPullService: {
+          deps: { onDeviceIssue: (event: PullDeviceIssueEvent) => void };
+          pullOnce: (session: unknown) => Promise<unknown>;
+        };
+      }).syncPullService;
+    const loopPullOnce = (engine: SyncEngine) =>
+      (engine as unknown as {
+        syncAutoLoop: { deps: { pullOnce: (session: unknown) => Promise<unknown> } };
+      }).syncAutoLoop.deps.pullOnce({});
+    const emptyPull = {
+      cursor: 3,
+      entriesApplied: 2,
+      filesWritten: 0,
+      filesDeleted: 0,
+      conflictsCreated: 0,
+    };
+
+    it("logs skips, shows one Notice per pull for new issues, and never needs attention", async () => {
+      const notify = vi.fn();
+      const setSyncStatus = vi.fn();
+      const recordActivity = vi.fn();
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: true } });
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        notify,
+        setSyncStatus,
+        recordActivity,
+        deviceSyncIssues,
+      });
+      const pull = pullDepsOf(engine);
+      vi.spyOn(pull, "pullOnce").mockImplementation(async () => {
+        pull.deps.onDeviceIssue({
+          kind: "skipped",
+          entryId: "a",
+          path: "2026/a?.md",
+          reason: 'Name not allowed on Windows (contains "?")',
+        });
+        pull.deps.onDeviceIssue({
+          kind: "write_failed",
+          entryId: "b",
+          path: "2026/b.md",
+          reason: "ENOENT: no such file",
+        });
+        return emptyPull;
+      });
+
+      await loopPullOnce(engine);
+
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect(notify).toHaveBeenCalledWith(
+        "Osync: 2 files couldn't be written on this device. Open sync status for details.",
+      );
+      expect(recordActivity).toHaveBeenCalledWith(
+        "skip",
+        'Not written on this device: 2026/a?.md (Name not allowed on Windows (contains "?"))',
+      );
+      expect(recordActivity).toHaveBeenCalledWith(
+        "skip",
+        "Not written on this device: 2026/b.md (ENOENT: no such file)",
+      );
+      expect(setSyncStatus).not.toHaveBeenCalledWith("attention_needed");
+      expect(deviceSyncIssues.getUnwritablePaths().map((entry) => entry.path)).toEqual([
+        "2026/a?.md",
+        "2026/b.md",
+      ]);
+
+      // The same issues again are not news: no second Notice.
+      await loopPullOnce(engine);
+      expect(notify).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses the singular Notice for one file", async () => {
+      const notify = vi.fn();
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        notify,
+        deviceSyncIssues: new DeviceSyncIssues({ platform: { isWin: false } }),
+      });
+      const pull = pullDepsOf(engine);
+      vi.spyOn(pull, "pullOnce").mockImplementation(async () => {
+        pull.deps.onDeviceIssue({ kind: "write_failed", entryId: "b", path: "b.md", reason: "x" });
+        return emptyPull;
+      });
+
+      await loopPullOnce(engine);
+
+      expect(notify).toHaveBeenCalledWith(
+        "Osync: 1 file couldn't be written on this device. Open sync status for details.",
+      );
+    });
+
+    it("excludes unwritable paths from the vault adapter's syncable predicate", () => {
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: true } });
+      deviceSyncIssues.applyPullEvent({
+        kind: "write_failed",
+        entryId: "f",
+        path: "Notes/locked.md",
+        reason: "EBUSY",
+      });
+      const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+        deviceSyncIssues,
+      });
+      const adapter = (engine as unknown as {
+        vaultAdapter: { isSyncablePath(path: string): boolean };
+      }).vaultAdapter;
+
+      expect(adapter.isSyncablePath("Notes/a?.md")).toBe(false);
+      expect(adapter.isSyncablePath("Notes/locked.md")).toBe(false);
+      expect(adapter.isSyncablePath("Notes/fine.md")).toBe(true);
+    });
+
+    it("retries failed writes by re-applying the recorded remote state", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const store = await createInitializedTestSyncStore(plugin);
+      const body = encodeUtf8("sermon body");
+      await store.applyRemoteState({
+        entryId: "e",
+        path: "2026/note.md",
+        revision: 2,
+        blobId: "blob-e",
+        hash: await hashBytes(body),
+        deleted: false,
+        updatedAt: 1,
+      });
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: false } });
+      deviceSyncIssues.applyPullEvent({
+        kind: "write_failed",
+        entryId: "e",
+        path: "2026/note.md",
+        reason: "EBUSY",
+      });
+      const engine = createEngine(plugin, { deviceSyncIssues });
+      engine.setStore(store);
+      const downloads = vi
+        .spyOn(engine, "downloadAndDecryptVersionBlob")
+        .mockResolvedValue(body);
+
+      const result = await engine.retryUnwritablePaths();
+
+      expect(result).toEqual({ retried: 1, failed: 0 });
+      expect(downloads).toHaveBeenCalledWith("blob-e");
+      expect(await plugin.app.vault.adapter.read("2026/note.md")).toBe("sermon body");
+      expect(await store.getLocalStateById("e")).toMatchObject({
+        path: "2026/note.md",
+        blobId: "blob-e",
+        hash: await hashBytes(body),
+        deleted: false,
+      });
+      expect(deviceSyncIssues.getUnwritablePaths()).toEqual([]);
+      await store.close();
+    });
+
+    it("does not overwrite a file edited locally while its path was excluded", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const store = await createInitializedTestSyncStore(plugin);
+      await store.upsertEntry({
+        entryId: "e",
+        path: "note.md",
+        revision: 1,
+        blobId: "blob-old",
+        hash: await hashBytes(encodeUtf8("old")),
+        deleted: false,
+        updatedAt: 1,
+        localMtime: null,
+        localSize: null,
+      });
+      await store.applyRemoteState({
+        entryId: "e",
+        path: "note.md",
+        revision: 2,
+        blobId: "blob-new",
+        hash: await hashBytes(encodeUtf8("new")),
+        deleted: false,
+        updatedAt: 2,
+      });
+      await plugin.app.vault.adapter.writeBinary("note.md", encodeUtf8("edited").slice().buffer);
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: false } });
+      deviceSyncIssues.applyPullEvent({ kind: "write_failed", entryId: "e", path: "note.md", reason: "x" });
+      const engine = createEngine(plugin, { deviceSyncIssues });
+      engine.setStore(store);
+      const downloads = vi.spyOn(engine, "downloadAndDecryptVersionBlob");
+
+      expect(await engine.retryUnwritablePaths()).toEqual({ retried: 1, failed: 0 });
+      expect(downloads).not.toHaveBeenCalled();
+      expect(deviceSyncIssues.getUnwritablePaths()).toEqual([]);
+      await store.close();
+    });
+
+    it("keeps a path listed when the retry fails again", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const store = await createInitializedTestSyncStore(plugin);
+      await store.applyRemoteState({
+        entryId: "e",
+        path: "note.md",
+        revision: 1,
+        blobId: "blob-e",
+        hash: "h",
+        deleted: false,
+        updatedAt: 1,
+      });
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: false } });
+      deviceSyncIssues.applyPullEvent({ kind: "write_failed", entryId: "e", path: "note.md", reason: "x" });
+      const engine = createEngine(plugin, { deviceSyncIssues });
+      engine.setStore(store);
+      vi.spyOn(engine, "downloadAndDecryptVersionBlob").mockRejectedValue(new Error("offline"));
+
+      expect(await engine.retryUnwritablePaths()).toEqual({ retried: 1, failed: 1 });
+      expect(deviceSyncIssues.getUnwritablePaths()).toEqual([
+        expect.objectContaining({ path: "note.md", reason: "offline" }),
+      ]);
+      expect(await store.getLocalStateById("e")).toBeNull();
+      await store.close();
+    });
+
+    it("warns once per path about local files Windows cannot open, but still uploads them", async () => {
+      const notify = vi.fn();
+      const recordActivity = vi.fn();
+      const plugin = createPlugin({}, async () => encodeUtf8("body"));
+      (plugin.app.vault.getFiles as ReturnType<typeof vi.fn>).mockReturnValue([
+        createFile("2026/what?.md"),
+        createFile("fine.md"),
+      ]);
+      const store = await createInitializedTestSyncStore(plugin);
+      const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: false } });
+      const engine = createEngine(plugin, { notify, recordActivity, deviceSyncIssues });
+      engine.setStore(store);
+
+      const first = await engine.reconcileOnce();
+      await engine.reconcileOnce();
+
+      expect(first.filesQueuedForUpsert).toBe(2);
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect(notify).toHaveBeenCalledWith(
+        'Osync: "what?.md" can\'t be opened on Windows (contains "?"). Rename it to sync to Windows devices.',
+      );
+      expect(recordActivity).toHaveBeenCalledWith(
+        "warning",
+        'Won\'t open on Windows: 2026/what?.md (contains "?")',
+      );
+      expect(deviceSyncIssues.getPortabilityWarnings()).toEqual([
+        { path: "2026/what?.md", reason: 'contains "?"' },
+      ]);
       await store.close();
     });
   });

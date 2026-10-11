@@ -14,20 +14,22 @@ import type {
   SyncRemoteEntryStore,
 } from "../store/ports";
 import {
+  ensureParentDirectories,
   ensureParentDirectoriesBatch,
   isMarkdownPath,
   removeVaultPathIfExists,
   type SyncVaultWriter,
 } from "../vault/vault-writer";
+import { matchesSyncFileRules, type SyncFileRules } from "../core/file-rules";
 import {
-  describePathLimit,
-  isPathWithinSyncLimits,
-} from "../core/path-limits";
-import { shouldSyncPath, type SyncFileRules } from "../core/file-rules";
+  describeDeviceWriteIssue,
+  type DevicePathPolicy,
+} from "../core/path-portability";
 import type { SyncEventGateLike } from "./event-gate";
 import { PullBlobPreparer } from "./pull-blob-preparer";
 import { PullManifestPlanner, type PullManifestStore } from "./pull-manifest-planner";
 import { PullPendingMutationHandler } from "./pull-pending-mutation-handler";
+import { detachLocalEntries, isUnreadablePlaceholderPath } from "./unreadable-entries";
 import {
   createPathDependencyBatches,
   DEFAULT_PREPARE_CONCURRENCY,
@@ -62,12 +64,39 @@ export interface PullEntryStateApplierDeps {
   // Notified (best-effort) when a remote entry could not be decrypted and was
   // quarantined, so callers can surface a diagnostic. Never throws the pull.
   onDecryptFailure?: (entryId: string) => void;
+  // Notified (best-effort) for every remote entry whose metadata decrypted, so a
+  // previously recorded decrypt failure for it can be cleared.
+  onEntryDecrypted?: (entryId: string) => void;
   // When provided, remote entries whose path is not syncable on this device
   // (e.g. inside an excluded folder) are recorded in the store but never written
   // to or deleted from disk — so they stop churning the vault while still
   // advancing the cursor. Omit to treat every path as syncable (legacy behavior).
   getSyncFileRules?: () => SyncFileRules;
+  // Whether this device can hold a path at all (Windows-invalid names, path limits,
+  // paths whose write already failed here). Unwritable paths are handled exactly like
+  // excluded ones. Omit to apply only the default path limits.
+  getDevicePathPolicy?: () => DevicePathPolicy;
+  // Best-effort report, after a window applied, of entries this device skipped or
+  // failed to write — and of entries that applied normally, so stale reports clear.
+  onDeviceIssue?: (event: PullDeviceIssueEvent) => void;
 }
+
+export type PullDeviceIssueEvent =
+  | {
+      // skipped: the path cannot exist on this device, so it was never attempted.
+      // write_failed: the write was attempted and threw.
+      kind: "skipped" | "write_failed";
+      entryId: string;
+      path: string;
+      reason: string;
+    }
+  | { kind: "resolved"; entryId: string; path: string };
+
+type DeviceSkipOutcome = {
+  kind: "skipped" | "write_failed";
+  path: string;
+  reason: string;
+};
 
 export interface PullEntryStateApplyResult {
   entriesApplied: number;
@@ -123,14 +152,58 @@ export class PullEntryStateApplier {
     this.pendingMutations = new PullPendingMutationHandler(deps);
   }
 
-  // A remote path that this device's file rules exclude (e.g. an excluded folder)
-  // must not touch the disk on pull. The remote state is still recorded so the
-  // cursor advances and the entry is not re-downloaded on every subsequent pull.
+  // A remote path that this device's file rules exclude (e.g. an excluded folder), or
+  // that this device cannot hold (see describeDeviceIssue), must not touch the disk on
+  // pull. The remote state is still recorded so the cursor advances and the entry is
+  // not re-downloaded on every subsequent pull.
   private isDiskWritablePath(path: string | null | undefined): boolean {
     if (!path) return false;
+    if (!this.matchesUserRules(path)) return false;
+    return this.describeDeviceIssue(path) === null;
+  }
+
+  private matchesUserRules(path: string): boolean {
     const getRules = this.deps.getSyncFileRules;
-    if (!getRules) return true;
-    return shouldSyncPath(path, getRules());
+    return !getRules || matchesSyncFileRules(path, getRules());
+  }
+
+  private describeDeviceIssue(path: string): string | null {
+    const policy = this.deps.getDevicePathPolicy?.();
+    return policy
+      ? policy.describeUnwritable(path)
+      : describeDeviceWriteIssue(path, { isWin: false });
+  }
+
+  // For a path the user's rules include: why this device cannot hold it, if it can't.
+  // User-excluded paths are not device issues and return null.
+  private deviceSkipOutcome(path: string): DeviceSkipOutcome | null {
+    if (!this.matchesUserRules(path)) return null;
+    const reason = this.describeDeviceIssue(path);
+    return reason ? { kind: "skipped", path, reason } : null;
+  }
+
+  private reportOutcomes(
+    plans: ReadonlyArray<PlannedEntryState>,
+    outcomes: ReadonlyMap<PlannedEntryState, DeviceSkipOutcome>,
+  ): void {
+    const report = this.deps.onDeviceIssue;
+    if (!report) return;
+    for (const plan of plans) {
+      const outcome = outcomes.get(plan);
+      try {
+        report(
+          outcome
+            ? { ...outcome, entryId: plan.state.entryId }
+            : {
+                kind: "resolved",
+                entryId: plan.state.entryId,
+                path: plan.finalPath ?? plan.metadata.path,
+              },
+        );
+      } catch (error) {
+        console.error("[osync] pull: device issue listener failed", error);
+      }
+    }
   }
 
   async createManifestItems(
@@ -140,14 +213,12 @@ export class PullEntryStateApplier {
       states,
       this.deps.prepareConcurrency ?? DEFAULT_PREPARE_CONCURRENCY,
       async (state): Promise<PullEntryStateManifestItem | null> => {
+        let metadata: PullEntryStateManifestItem["metadata"];
         try {
-          return {
-            state,
-            metadata: await this.deps.crypto.decryptMetadata(
-              state.encryptedMetadata,
-              metadataContextFromRemoteState(state),
-            ),
-          };
+          metadata = await this.deps.crypto.decryptMetadata(
+            state.encryptedMetadata,
+            metadataContextFromRemoteState(state),
+          );
         } catch (error) {
           // One undecryptable entry (key rotation, corrupt ciphertext, a poisoned row)
           // must not abort the whole page — that would stall the pull at this cursor and
@@ -160,6 +231,12 @@ export class PullEntryStateApplier {
           this.deps.onDecryptFailure?.(ctx.entryId);
           return null;
         }
+        try {
+          this.deps.onEntryDecrypted?.(state.entryId);
+        } catch (error) {
+          console.error("[osync] pull: decrypt listener failed", error);
+        }
+        return { state, metadata };
       },
     );
     return items.filter((item): item is PullEntryStateManifestItem => item !== null);
@@ -206,6 +283,7 @@ export class PullEntryStateApplier {
       };
     },
   ): Promise<PullEntryStateWindowApplyResult> {
+    manifest = await this.setAsideUnreadablePlaceholders(store, manifest);
     if (manifest.length === 0) {
       return {
         entriesApplied: 0,
@@ -239,6 +317,32 @@ export class PullEntryStateApplier {
       ),
       deferred: prepared.deferred,
     };
+  }
+
+  // A removed unreadable entry carries a placeholder path, not a real one (see
+  // unreadable-entries.ts). It must never touch the disk: not written, and never a
+  // reason to remove a file — even when this device still maps the entry to a real
+  // local file (the device that wrote it with the wrong key, or one that had an older
+  // readable revision). Such a mapping is forgotten instead, so the local file is
+  // uploaded again as a new entry by the next scan.
+  private async setAsideUnreadablePlaceholders(
+    store: PullEntryStateStore,
+    manifest: PullEntryStateManifestItem[],
+  ): Promise<PullEntryStateManifestItem[]> {
+    const placeholders = manifest.filter((item) => isUnreadablePlaceholderPath(item.metadata.path));
+    if (placeholders.length === 0) {
+      return manifest;
+    }
+    const detached = await detachLocalEntries(
+      store,
+      placeholders.map((item) => item.state.entryId),
+    );
+    if (detached.length > 0) {
+      console.info(
+        `[osync] pull: ${detached.length} removed unreadable entr${detached.length === 1 ? "y" : "ies"} forgotten locally; local files are kept and will upload as new entries`,
+      );
+    }
+    return manifest.filter((item) => !isUnreadablePlaceholderPath(item.metadata.path));
   }
 
   private async prepareManifestApplication(
@@ -333,6 +437,9 @@ export class PullEntryStateApplier {
     const originalDirtyEntries = await this.snapshotDirtyEntries(store, prepared);
     const pendingConflictsByPlan = groupPendingConflictsByPlan(prepared.pendingConflicts);
 
+    // Per-plan device outcome; absent = applied normally.
+    const outcomes = new Map<PlannedEntryState, DeviceSkipOutcome>();
+
     try {
       let filesDeleted = 0;
       let entriesApplied = 0;
@@ -364,45 +471,78 @@ export class PullEntryStateApplier {
             let removed = 0;
             if (!skipDeletions) {
               for (const path of batch.pathsToRemove) {
-                // Never touch the disk for paths excluded on this device.
+                // Never touch the disk for paths excluded on (or unwritable by) this
+                // device — on Windows even exists() can throw for an invalid name.
                 if (!this.isDiskWritablePath(path)) continue;
-                if (await removeVaultPathIfExists(this.deps.vaultAdapter, path)) {
-                  removed += 1;
+                try {
+                  if (await removeVaultPathIfExists(this.deps.vaultAdapter, path)) {
+                    removed += 1;
+                  }
+                } catch (error) {
+                  // A locked/undeletable file must not stall the pull at this cursor
+                  // forever. The stale file stays on disk for the next local scan.
+                  console.warn(`[osync] pull: could not remove ${path}`, error);
                 }
               }
             }
 
+            // Plans this device does not hold on disk (skipped as unwritable, or whose
+            // write failed) record only their remote state; see bulkOps below.
+            const remoteOnlyPlans = new Set<PlannedEntryState>();
             const writablePlans = batch.blobs.filter(({ plan }) => {
               if (!plan.finalPath) return false;
               if (skipRemoteWritePlans.has(plan)) return false;
-              if (!this.isDiskWritablePath(plan.finalPath)) return false;
-              if (!isPathWithinSyncLimits(plan.finalPath)) {
-                const detail = describePathLimit(plan.finalPath);
-                console.warn(
-                  `[osync:path-limit] skipping write of ${plan.finalPath}: ${
-                    detail.ok ? "ok" : `${detail.reason} (${detail.byteSize}b > ${detail.limit}b)`
-                  }`,
-                );
+              if (!this.isDiskWritablePath(plan.finalPath)) {
+                const skip = this.deviceSkipOutcome(plan.finalPath);
+                if (skip) {
+                  console.warn(`[osync] pull: skipping write of ${skip.path}: ${skip.reason}`);
+                  outcomes.set(plan, skip);
+                  remoteOnlyPlans.add(plan);
+                }
                 return false;
               }
               return true;
             });
-            await ensureParentDirectoriesBatch(
-              this.deps.vaultAdapter,
-              writablePlans.map(({ plan }) => plan.finalPath!),
-            );
+            // One file that cannot be written on this device (a name the OS rejects, a
+            // locked file, a failed mkdir) must not throw the whole window: that rolls
+            // everything back and re-downloads the same blobs forever. Isolate the
+            // failure to its own entry and let the rest of the window apply.
+            let parentsReady = true;
+            try {
+              await ensureParentDirectoriesBatch(
+                this.deps.vaultAdapter,
+                writablePlans.map(({ plan }) => plan.finalPath!),
+              );
+            } catch {
+              // Retry per file below so only the files under the failing folder fail.
+              parentsReady = false;
+            }
             await mapWithConcurrency(
               writablePlans,
-              FILE_WRITE_CONCURRENCY,
+              // Per-file mkdir of shared parents must not race.
+              parentsReady ? FILE_WRITE_CONCURRENCY : 1,
               async ({ plan, bytes }) => {
                 const finalPath = plan.finalPath!;
-                if (isMarkdownPath(finalPath)) {
-                  await this.deps.vaultAdapter.writeText(
-                    finalPath,
-                    new TextDecoder().decode(bytes),
-                  );
-                } else {
-                  await this.deps.vaultAdapter.writeBinary(finalPath, bytes);
+                try {
+                  if (!parentsReady) {
+                    await ensureParentDirectories(this.deps.vaultAdapter, finalPath);
+                  }
+                  if (isMarkdownPath(finalPath)) {
+                    await this.deps.vaultAdapter.writeText(
+                      finalPath,
+                      new TextDecoder().decode(bytes),
+                    );
+                  } else {
+                    await this.deps.vaultAdapter.writeBinary(finalPath, bytes);
+                  }
+                } catch (error) {
+                  console.error(`[osync] pull: could not write ${finalPath}`, error);
+                  remoteOnlyPlans.add(plan);
+                  outcomes.set(plan, {
+                    kind: "write_failed",
+                    path: finalPath,
+                    reason: describeWriteError(error),
+                  });
                 }
               },
             );
@@ -410,7 +550,11 @@ export class PullEntryStateApplier {
             removedTotal += removed;
 
             const bulkOps: BulkEntryApplyOp[] = batch.plans.map((plan) => {
-              if (skipRemoteWritePlans.has(plan)) {
+              // A device-skipped or failed write records only the remote state and leaves
+              // the local state as it was (no row at all for a new file), so the entry is
+              // never "known locally but missing" — which the next scan would push as a
+              // delete — even if the device exclusion is later lifted or lost.
+              if (skipRemoteWritePlans.has(plan) || remoteOnlyPlans.has(plan)) {
                 // rebase-client: only refresh remote state row; preserve local
                 // state and disk content reflecting the winning local edits.
                 return {
@@ -469,8 +613,27 @@ export class PullEntryStateApplier {
               }
             } else if (plan.finalPath) {
               if (this.isDiskWritablePath(plan.finalPath)) {
-                if (!(await this.deps.vaultAdapter.exists(plan.finalPath))) {
-                  await this.deps.vaultAdapter.mkdir(plan.finalPath);
+                try {
+                  if (!(await this.deps.vaultAdapter.exists(plan.finalPath))) {
+                    await this.deps.vaultAdapter.mkdir(plan.finalPath);
+                  }
+                } catch (error) {
+                  console.error(
+                    `[osync] pull: could not create folder ${plan.finalPath}`,
+                    error,
+                  );
+                  outcomes.set(plan, {
+                    kind: "write_failed",
+                    path: plan.finalPath,
+                    reason: describeWriteError(error),
+                  });
+                  await this.forgetLocalFolderPath(store, plan.state.entryId);
+                }
+              } else {
+                const skip = this.deviceSkipOutcome(plan.finalPath);
+                if (skip) {
+                  outcomes.set(plan, skip);
+                  await this.forgetLocalFolderPath(store, plan.state.entryId);
                 }
               }
               const oldPath = plan.existing?.path;
@@ -487,7 +650,11 @@ export class PullEntryStateApplier {
               return bDepth - aDepth;
             });
             for (const folderPath of foldersToDelete) {
-              await this.safeDeleteFolder(folderPath);
+              try {
+                await this.safeDeleteFolder(folderPath);
+              } catch (error) {
+                console.warn(`[osync] pull: could not remove folder ${folderPath}`, error);
+              }
             }
           }
 
@@ -495,11 +662,25 @@ export class PullEntryStateApplier {
         },
       );
 
+      this.reportOutcomes(prepared.plans, outcomes);
       return filesDeleted;
     } catch (error) {
       await this.restoreManifestEntries(store, originalEntries);
       await this.restoreDirtyEntries(store, originalDirtyEntries);
       throw error;
+    }
+  }
+
+  // Same rule as a device-skipped or failed file write: a folder this device does not
+  // hold must not stay recorded as present locally, or the next scan propagates its
+  // absence as a delete. (Folder rows were already upserted with the batch.)
+  private async forgetLocalFolderPath(
+    store: PullEntryStateStore,
+    entryId: string,
+  ): Promise<void> {
+    const local = await store.getLocalStateById(entryId);
+    if (local?.path) {
+      await store.applyLocalState({ ...local, path: null });
     }
   }
 
@@ -642,6 +823,12 @@ export class PullEntryStateApplier {
 
     return await this.deps.eventGate.suppressPaths(uniqueSyncPaths(paths), action);
   }
+}
+
+function describeWriteError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const text = message.replace(/\s+/g, " ").trim();
+  return text.length > 160 ? `${text.slice(0, 159)}…` : text;
 }
 
 function collectFolderPathsForSuppression(

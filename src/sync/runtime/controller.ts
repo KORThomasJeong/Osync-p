@@ -1,4 +1,4 @@
-import { Notice, type Plugin } from "obsidian";
+import { Notice, Platform, type Plugin } from "obsidian";
 
 import type { SyncCryptoService } from "../core/crypto-service";
 import type { SyncTokenResponse } from "../remote/client";
@@ -34,6 +34,31 @@ import type {
   UserVisibleSyncProgress,
   UserVisibleSyncState,
 } from "./user-visible-status";
+import {
+  DeviceSyncIssues,
+  type DeviceSyncIssuesStorage,
+  type PortabilityWarning,
+  type UnwritablePathEntry,
+} from "./device-sync-issues";
+import type { DevicePlatform } from "../core/path-portability";
+import { RemoteVaultKeyMismatchError } from "../../remote-vault/types";
+import type {
+  UnreadableRemoteEntry,
+  UnreadableRemovalResult,
+  UnreadableScanResult,
+} from "../engine/unreadable-entries";
+
+export type {
+  UnreadableRemoteEntry,
+  UnreadableRemovalResult,
+  UnreadableScanResult,
+} from "../engine/unreadable-entries";
+
+export type {
+  DeviceSyncIssuesStorage,
+  PortabilityWarning,
+  UnwritablePathEntry,
+} from "./device-sync-issues";
 
 export type { InitialCollisionPreview } from "./engine";
 export type { SyncActivityEntry, SyncActivityLogStorage } from "./activity-log";
@@ -74,6 +99,15 @@ export interface SyncControllerDeps {
   onStatusChange?: () => void;
   // Persists the sync activity log across restarts; in-memory only when omitted.
   activityLogStorage?: SyncActivityLogStorage;
+  // Persists the "not synced to this device" list; in-memory only when omitted.
+  unwritablePathsStorage?: DeviceSyncIssuesStorage;
+  // Persists the ids of server entries this device's key cannot decrypt.
+  unreadableEntriesStorage?: DeviceSyncIssuesStorage;
+  // The server refused this device's vault key. Sync is stopped; the user must
+  // re-enter the vault password.
+  onVaultKeyMismatch?: () => void;
+  // Defaults to Obsidian's Platform (Windows rejects some file names).
+  platform?: DevicePlatform;
 }
 
 export class SyncController {
@@ -82,6 +116,11 @@ export class SyncController {
   );
   private readonly activityLog = new SyncActivityLog({
     storage: this.deps.activityLogStorage,
+  });
+  private readonly deviceSyncIssues = new DeviceSyncIssues({
+    platform: this.deps.platform ?? { isWin: Platform.isWin },
+    storage: this.deps.unwritablePathsStorage,
+    unreadableStorage: this.deps.unreadableEntriesStorage,
   });
   private readonly syncEngine = new SyncEngine({
     plugin: this.deps.plugin,
@@ -98,6 +137,8 @@ export class SyncController {
     setSyncStatus: (status) => this.statusTracker.setStatus(status),
     setStorageStatus: (status) => this.statusTracker.setStorageStatus(status),
     recordActivity: (kind, message) => this.activityLog.record(kind, message),
+    deviceSyncIssues: this.deviceSyncIssues,
+    onVaultKeyMismatch: () => this.deps.onVaultKeyMismatch?.(),
   });
   private readonly conflictQueue = new SyncConflictQueue();
   private startupRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -154,6 +195,82 @@ export class SyncController {
 
   clearActivityLog(): void {
     this.activityLog.clear();
+  }
+
+  // Remote files this device skipped (a name it cannot hold, a path over the limits)
+  // or failed to write. They stay intact on the server and on other devices.
+  getUnwritablePaths(): readonly UnwritablePathEntry[] {
+    return this.deviceSyncIssues.getUnwritablePaths();
+  }
+
+  // Local files that upload fine but cannot be opened on Windows devices.
+  getPortabilityWarnings(): readonly PortabilityWarning[] {
+    return this.deviceSyncIssues.getPortabilityWarnings();
+  }
+
+  // Server entries this device's vault key cannot decrypt (quarantined by the pull,
+  // or found by a full scan). Changes are reported via onDeviceSyncIssuesChange.
+  getUnreadableEntryCount(): number {
+    return this.deviceSyncIssues.getUnreadableEntryCount();
+  }
+
+  onDeviceSyncIssuesChange(listener: () => void): () => void {
+    return this.deviceSyncIssues.onChange(listener);
+  }
+
+  async scanUnreadableEntries(
+    onProgress?: (scanned: number, total: number) => void,
+  ): Promise<UnreadableScanResult & { knownLocally: string[] }> {
+    this.requireSyncReady();
+    const result = await this.syncEngine.scanUnreadableRemoteEntries(onProgress);
+    this.activityLog.record(
+      "resume",
+      `Key check: ${result.unreadable.length} of ${result.scannedEntries} server entries can't be decrypted`,
+    );
+    return result;
+  }
+
+  async removeUnreadableEntries(
+    targets: readonly UnreadableRemoteEntry[],
+  ): Promise<UnreadableRemovalResult> {
+    this.requireSyncReady();
+    return await this.syncEngine.removeUnreadableRemoteEntries(targets);
+  }
+
+  async reuploadUnreadableLocalEntries(entryIds: readonly string[]): Promise<number> {
+    this.requireSyncReady();
+    return await this.syncEngine.reuploadUnreadableLocalEntries(entryIds);
+  }
+
+  private requireSyncReady(): void {
+    if (!this.deps.hasActiveRemoteVaultSession() || !this.deps.hasAuthenticatedSession()) {
+      throw new Error("Connect and sign in first.");
+    }
+    if (!this.syncEngine.hasStore()) {
+      throw new Error("Local sync store is not initialized.");
+    }
+  }
+
+  // Re-attempts the files whose write failed on this device, then runs a catch-up
+  // check. Paths this device can never hold (e.g. Windows-invalid names) stay listed.
+  // Never throws; failures are listed again and logged.
+  async retryUnwritablePaths(): Promise<void> {
+    try {
+      const result = await this.syncEngine.retryUnwritablePaths();
+      if (result.retried > 0) {
+        this.activityLog.record(
+          "resume",
+          `Retried ${result.retried} unwritten file${result.retried === 1 ? "" : "s"}: ${
+            result.retried - result.failed
+          } written, ${result.failed} failed`,
+        );
+      }
+    } catch (error) {
+      this.activityLog.record("error", `Retry failed: ${describeActivityError(error)}`);
+      this.deps.notifyError(error, "Retry failed");
+      return;
+    }
+    await this.checkNow();
   }
 
   // Count of local changes recorded but not yet accepted by the server.
@@ -376,6 +493,14 @@ export class SyncController {
       if (error instanceof MassDeleteGuardError) {
         this.cancelStartupRetry();
         this.handleMassDeleteGuard(error);
+        return;
+      }
+      if (error instanceof RemoteVaultKeyMismatchError) {
+        this.cancelStartupRetry();
+        this.syncEngine.stopAutoSync();
+        this.activityLog.record("error", "Sync stopped: the server refused this device's vault key");
+        this.statusTracker.setStatus("attention_needed");
+        this.deps.onVaultKeyMismatch?.();
         return;
       }
       const classification = classifyReconnectError(error);

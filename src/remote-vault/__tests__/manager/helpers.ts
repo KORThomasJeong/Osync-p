@@ -40,14 +40,18 @@ export function createManager(input: {
   refreshUi?: () => void;
   notify?: (message: string) => void;
   getCachedRemoteVaultSummary?: () => {
+    vaultId?: string;
     vaultName: string;
     activeKeyVersion: number;
+    keyFingerprint?: string | null;
   } | null;
   saveCachedRemoteVaultSummary?: (summary: {
     vaultId: string;
     vaultName: string;
     activeKeyVersion: number;
+    keyFingerprint?: string | null;
   }) => void;
+  onStoredKeyMismatch?: (vaultId: string) => void;
   remoteVaultClient?: RemoteVaultClientOverrides;
 }) {
   return new RemoteVaultManager({
@@ -63,6 +67,7 @@ export function createManager(input: {
     notify: input.notify ?? vi.fn(),
     getCachedRemoteVaultSummary: input.getCachedRemoteVaultSummary,
     saveCachedRemoteVaultSummary: input.saveCachedRemoteVaultSummary,
+    onStoredKeyMismatch: input.onStoredKeyMismatch,
     remoteVaultClient: {
       createRemoteVault:
         input.remoteVaultClient?.createRemoteVault ??

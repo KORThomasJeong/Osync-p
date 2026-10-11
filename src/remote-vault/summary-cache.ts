@@ -6,6 +6,9 @@ export interface CachedRemoteVaultSummary {
   vaultId: string;
   vaultName: string;
   activeKeyVersion: number;
+  // The server's recorded key fingerprint for vaultId (null: unset on the server).
+  // Lets a restart verify the stored key offline. Absent in caches before 2.5.1.
+  keyFingerprint?: string | null;
 }
 
 export function readCachedRemoteVaultSummary(
@@ -27,7 +30,13 @@ export function readCachedRemoteVaultSummary(
     return null;
   }
 
-  return { vaultId, vaultName, activeKeyVersion };
+  const keyFingerprint = candidate.keyFingerprint;
+  return {
+    vaultId,
+    vaultName,
+    activeKeyVersion,
+    ...(typeof keyFingerprint === "string" || keyFingerprint === null ? { keyFingerprint } : {}),
+  };
 }
 
 export function writeCachedRemoteVaultSummary(
@@ -38,5 +47,6 @@ export function writeCachedRemoteVaultSummary(
     vaultId: summary.vaultId,
     vaultName: summary.vaultName,
     activeKeyVersion: summary.activeKeyVersion,
+    ...(summary.keyFingerprint !== undefined ? { keyFingerprint: summary.keyFingerprint } : {}),
   });
 }

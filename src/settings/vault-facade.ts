@@ -13,4 +13,7 @@ export interface OsyncVaultFacade {
   openRemoteVaultManagementPage(): void;
   disconnectRemoteVault(): Promise<void>;
   changeVaultPasswordFromPrompt(): Promise<void>;
+  // Compares this device's vault key with the vault's recorded fingerprint and
+  // counts server entries it cannot decrypt.
+  openVerifyVaultKey(): void;
 }

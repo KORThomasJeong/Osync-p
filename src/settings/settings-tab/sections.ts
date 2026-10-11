@@ -169,6 +169,17 @@ export function renderRemoteVaultSettings(
       );
 
     new Setting(containerEl)
+      .setName("Vault key")
+      .setDesc(
+        "Check that this device uses this vault's key and find server entries it can't decrypt.",
+      )
+      .addButton((button) =>
+        button.setButtonText("Verify vault key").onClick(() => {
+          controller.openVerifyVaultKey();
+        }),
+      );
+
+    new Setting(containerEl)
       .setName("Reset local sync state")
       .setDesc(
         "Clears this device's local sync cache and re-syncs from the server. " +

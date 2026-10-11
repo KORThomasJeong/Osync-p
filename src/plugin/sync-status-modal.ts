@@ -25,6 +25,16 @@ export interface OsyncSyncStatusSource {
   onActivityLogChange(listener: () => void): () => void;
   clearActivityLog(): void;
   onStatusChange(listener: () => void): () => void;
+  // Remote files this device skipped or failed to write (never "attention needed").
+  getUnwritablePaths(): readonly { path: string; reason: string; at: number }[];
+  // Local files that sync but cannot be opened on Windows.
+  getPortabilityWarnings(): readonly { path: string; reason: string }[];
+  onDeviceSyncIssuesChange(listener: () => void): () => void;
+  retryUnwritablePaths(): Promise<void>;
+  // Server entries this device's vault key cannot decrypt (reported with device issues).
+  getUnreadableEntryCount?(): number;
+  // Opens the "Verify vault key" modal.
+  openVerifyVaultKey?(): void;
   // Optional: keeps storage usage fresh while the modal is open.
   watchStorageStatus?(): void;
   unwatchStorageStatus?(): void;
@@ -66,6 +76,9 @@ export class OsyncSyncStatusModal extends Modal {
   private conflictsButtonEl: HTMLButtonElement | null = null;
   private activitySummaryEl: HTMLElement | null = null;
   private activityListEl: HTMLElement | null = null;
+  private deviceIssuesEl: HTMLElement | null = null;
+  private retryButtonEl: HTMLButtonElement | null = null;
+  private retryRunning = false;
 
   constructor(
     app: App,
@@ -105,6 +118,19 @@ export class OsyncSyncStatusModal extends Modal {
       this.source.openConflicts();
     });
 
+    if (this.source.openVerifyVaultKey) {
+      const verifyButton = actions.createEl("button", {
+        cls: "osync-status-verify-key",
+        text: "Verify vault key",
+      });
+      verifyButton.addEventListener("click", () => {
+        this.close();
+        this.source.openVerifyVaultKey?.();
+      });
+    }
+
+    this.deviceIssuesEl = contentEl.createDiv({ cls: "osync-status-device-issues" });
+
     const activity = contentEl.createEl("details", { cls: "osync-status-activity" });
     this.activitySummaryEl = activity.createEl("summary", { cls: "osync-status-activity-summary" });
     const activityActions = activity.createDiv({ cls: "osync-status-activity-actions" });
@@ -130,6 +156,12 @@ export class OsyncSyncStatusModal extends Modal {
         this.renderActivity();
       }),
     );
+    this.cleanups.push(
+      this.source.onDeviceSyncIssuesChange(() => {
+        this.renderStatus();
+        this.renderDeviceIssues();
+      }),
+    );
     const timer = setInterval(() => {
       this.renderLastCheck();
     }, this.lastCheckRefreshMs);
@@ -144,6 +176,7 @@ export class OsyncSyncStatusModal extends Modal {
     }
 
     this.renderStatus();
+    this.renderDeviceIssues();
     this.renderActivity();
     this.requestPendingUploadCount();
   }
@@ -170,7 +203,11 @@ export class OsyncSyncStatusModal extends Modal {
     }
     this.headerIconEl?.setAttr("data-state", state);
     this.headerTextEl?.setText(
-      formatSyncStateHeadline(state, this.source.getSyncStatusLabel()),
+      formatSyncStateHeadline(
+        state,
+        this.source.getSyncStatusLabel(),
+        this.source.getUnwritablePaths().length,
+      ),
     );
     this.renderLastCheck();
     this.renderSummary();
@@ -200,6 +237,97 @@ export class OsyncSyncStatusModal extends Modal {
       this.checkButtonTextEl.setText(this.checkRunning ? "Checking…" : "Check now");
     }
     this.conflictsButtonEl?.setText(`Sync conflicts (${this.source.getConflictCount()})`);
+  }
+
+  // Collapsible lists of files not synced to this device and files that won't open on
+  // Windows; each section is shown only when it has entries.
+  private renderDeviceIssues(): void {
+    const container = this.deviceIssuesEl;
+    if (!this.isOpen || !container) return;
+    container.empty();
+    this.retryButtonEl = null;
+
+    const unwritable = this.source.getUnwritablePaths();
+    if (unwritable.length > 0) {
+      const details = container.createEl("details", { cls: "osync-status-unwritable" });
+      details.createEl("summary", {
+        cls: "osync-status-unwritable-summary",
+        text: `Not synced to this device (${unwritable.length})`,
+      });
+      const actions = details.createDiv({ cls: "osync-status-issue-actions" });
+      this.retryButtonEl = actions.createEl("button", {
+        cls: "osync-status-unwritable-retry",
+        text: "Retry",
+      });
+      this.retryButtonEl.disabled = this.retryRunning;
+      this.retryButtonEl.addEventListener("click", () => {
+        void this.runRetry();
+      });
+      const list = details.createDiv({ cls: "osync-status-issue-list" });
+      for (const entry of unwritable) {
+        const row = list.createDiv({ cls: "osync-status-issue-row" });
+        row.createSpan({ cls: "osync-status-issue-path", text: entry.path });
+        row.createSpan({ cls: "osync-status-issue-reason", text: entry.reason });
+      }
+    }
+
+    const unreadable = this.source.getUnreadableEntryCount?.() ?? 0;
+    if (unreadable > 0) {
+      const details = container.createEl("details", { cls: "osync-status-unreadable" });
+      details.createEl("summary", {
+        cls: "osync-status-unreadable-summary",
+        text: `Can't be decrypted with this vault's key (${unreadable})`,
+      });
+      details.createDiv({
+        cls: "osync-status-unreadable-hint",
+        text: "These server entries were written with a different key and are skipped on this device. Run \"Verify vault key\" to check this device's key and clean them up.",
+      });
+      if (this.source.openVerifyVaultKey) {
+        const actions = details.createDiv({ cls: "osync-status-issue-actions" });
+        const verify = actions.createEl("button", {
+          cls: "osync-status-unreadable-verify",
+          text: "Verify vault key",
+        });
+        verify.addEventListener("click", () => {
+          this.close();
+          this.source.openVerifyVaultKey?.();
+        });
+      }
+    }
+
+    const warnings = this.source.getPortabilityWarnings();
+    if (warnings.length > 0) {
+      const details = container.createEl("details", { cls: "osync-status-portability" });
+      details.createEl("summary", {
+        cls: "osync-status-portability-summary",
+        text: `Won't open on Windows (${warnings.length})`,
+      });
+      details.createDiv({
+        cls: "osync-status-portability-hint",
+        text: "These files sync, but Windows devices can't save them. Rename them to sync them to Windows devices.",
+      });
+      const list = details.createDiv({ cls: "osync-status-issue-list" });
+      for (const warning of warnings) {
+        const row = list.createDiv({ cls: "osync-status-issue-row" });
+        row.createSpan({ cls: "osync-status-issue-path", text: warning.path });
+        row.createSpan({ cls: "osync-status-issue-reason", text: warning.reason });
+      }
+    }
+  }
+
+  private async runRetry(): Promise<void> {
+    if (this.retryRunning) return;
+    this.retryRunning = true;
+    if (this.retryButtonEl) this.retryButtonEl.disabled = true;
+    try {
+      await this.source.retryUnwritablePaths();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      new Notice(`Osync: Retry failed: ${message}`);
+    } finally {
+      this.retryRunning = false;
+      if (this.retryButtonEl) this.retryButtonEl.disabled = false;
+    }
   }
 
   private renderActivity(): void {

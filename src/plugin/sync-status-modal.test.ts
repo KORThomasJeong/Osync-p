@@ -98,6 +98,12 @@ interface FakeSource extends OsyncSyncStatusSource {
   checkNowImpl: () => Promise<void>;
   openConflictsCalls: number;
   fireStatus(): void;
+  unwritable: { path: string; reason: string; at: number }[];
+  warnings: { path: string; reason: string }[];
+  issueListeners: Set<() => void>;
+  retryImpl: () => Promise<void>;
+  retryCalls: number;
+  fireIssues(): void;
 }
 
 function createSource(): FakeSource {
@@ -137,6 +143,24 @@ function createSource(): FakeSource {
     },
     fireStatus: () => {
       for (const listener of source.statusListeners) listener();
+    },
+    unwritable: [],
+    warnings: [],
+    issueListeners: new Set(),
+    retryImpl: async () => {},
+    retryCalls: 0,
+    getUnwritablePaths: () => source.unwritable,
+    getPortabilityWarnings: () => source.warnings,
+    onDeviceSyncIssuesChange: (listener) => {
+      source.issueListeners.add(listener);
+      return () => source.issueListeners.delete(listener);
+    },
+    retryUnwritablePaths: () => {
+      source.retryCalls += 1;
+      return source.retryImpl();
+    },
+    fireIssues: () => {
+      for (const listener of source.issueListeners) listener();
     },
   };
   return source;
@@ -317,6 +341,94 @@ describe("OsyncSyncStatusModal", () => {
     expect(getCreatedNotices()).toContain("Osync: Could not copy activity log: denied");
   });
 
+  describe("device sync issues", () => {
+    const hasClass = (root: FakeEl, cls: string) => root.all().some((el) => el.classes.has(cls));
+
+    it("shows no device sections when there is nothing to report", () => {
+      const { root } = openModal(createSource());
+      expect(hasClass(root, "osync-status-unwritable")).toBe(false);
+      expect(hasClass(root, "osync-status-portability")).toBe(false);
+      expect(root.find("osync-status-header-text").text).toBe("Up to date");
+    });
+
+    it("lists files not synced to this device with a Retry button, and counts them in the headline", async () => {
+      const source = createSource();
+      source.unwritable = [
+        { path: "2026/a?.md", reason: 'Name not allowed on Windows (contains "?")', at: 1 },
+      ];
+      let finish: () => void = () => {};
+      source.retryImpl = () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+      const { root } = openModal(source);
+
+      expect(root.find("osync-status-header-text").text).toBe(
+        "Up to date · 1 file not synced here",
+      );
+      expect(root.find("osync-status-header-icon").iconId).toBe("cloud-check");
+      const details = root.find("osync-status-unwritable");
+      expect(details.tag).toBe("details");
+      expect(root.find("osync-status-unwritable-summary").text).toBe(
+        "Not synced to this device (1)",
+      );
+      const rows = root.all().filter((el) => el.classes.has("osync-status-issue-row"));
+      expect(rows.map((row) => root.textOf(row))).toEqual([
+        '2026/a?.md Name not allowed on Windows (contains "?")',
+      ]);
+
+      const retry = root.find("osync-status-unwritable-retry");
+      retry.click();
+      expect(source.retryCalls).toBe(1);
+      expect(retry.disabled).toBe(true);
+      finish();
+      await flush();
+      expect(retry.disabled).toBe(false);
+    });
+
+    it("lists files that won't open on Windows with a rename hint", () => {
+      const source = createSource();
+      source.warnings = [{ path: "2026/b?.md", reason: 'contains "?"' }];
+      const { root } = openModal(source);
+
+      expect(root.find("osync-status-portability-summary").text).toBe(
+        "Won't open on Windows (1)",
+      );
+      expect(root.find("osync-status-portability-hint").text).toContain("Rename");
+      const rows = root.all().filter((el) => el.classes.has("osync-status-issue-row"));
+      expect(rows.map((row) => root.textOf(row))).toEqual(['2026/b?.md contains "?"']);
+      // Warnings alone do not change the headline.
+      expect(root.find("osync-status-header-text").text).toBe("Up to date");
+    });
+
+    it("updates live and unsubscribes on close", () => {
+      const source = createSource();
+      const { modal, root } = openModal(source);
+      source.unwritable = [{ path: "x.md", reason: "EBUSY", at: 1 }];
+      source.fireIssues();
+      expect(root.find("osync-status-unwritable-summary").text).toBe(
+        "Not synced to this device (1)",
+      );
+      expect(root.find("osync-status-header-text").text).toBe(
+        "Up to date · 1 file not synced here",
+      );
+      modal.close();
+      expect(source.issueListeners.size).toBe(0);
+    });
+
+    it("shows a notice when Retry fails", async () => {
+      const source = createSource();
+      source.unwritable = [{ path: "x.md", reason: "EBUSY", at: 1 }];
+      source.retryImpl = async () => {
+        throw new Error("offline");
+      };
+      const { root } = openModal(source);
+      root.find("osync-status-unwritable-retry").click();
+      await flush();
+      expect(getCreatedNotices()).toContain("Osync: Retry failed: offline");
+    });
+  });
+
   it("clears the activity log", () => {
     const source = createSource();
     source.log = [{ at: 1, kind: "push", message: "ok" }];
@@ -325,5 +437,40 @@ describe("OsyncSyncStatusModal", () => {
     expect(source.log).toEqual([]);
     expect(root.find("osync-status-activity-summary").text).toBe("Recent activity (0)");
     expect(root.find("osync-status-activity-empty").text).toBe("No recent activity.");
+  });
+
+  describe("vault key", () => {
+    it("lists entries that can't be decrypted and opens the key check from there", async () => {
+      const source = createSource();
+      let unreadable = 0;
+      const openVerifyVaultKey = vi.fn();
+      source.getUnreadableEntryCount = () => unreadable;
+      source.openVerifyVaultKey = openVerifyVaultKey;
+      const { root } = openModal(source);
+      await flush();
+
+      expect(() => root.find("osync-status-unreadable")).toThrow();
+
+      unreadable = 507;
+      source.fireIssues();
+
+      expect(root.find("osync-status-unreadable-summary").text).toBe(
+        "Can't be decrypted with this vault's key (507)",
+      );
+      root.find("osync-status-unreadable-verify").click();
+      expect(openVerifyVaultKey).toHaveBeenCalledTimes(1);
+    });
+
+    it("has a Verify vault key button in the actions row", async () => {
+      const source = createSource();
+      const openVerifyVaultKey = vi.fn();
+      source.openVerifyVaultKey = openVerifyVaultKey;
+      const { root } = openModal(source);
+      await flush();
+
+      root.find("osync-status-verify-key").click();
+
+      expect(openVerifyVaultKey).toHaveBeenCalledTimes(1);
+    });
   });
 });

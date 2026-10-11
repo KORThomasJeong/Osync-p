@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { SyncHttpError } from "../../http/request";
-import { RemoteVaultPasswordChangedError } from "../../remote-vault/types";
+import {
+  RemoteVaultKeyMismatchError,
+  RemoteVaultPasswordChangedError,
+} from "../../remote-vault/types";
 import { classifyReconnectError } from "./reconnect-error";
 import { SyncRealtimeError } from "./realtime-types";
 
@@ -33,6 +36,14 @@ describe("classifyReconnectError", () => {
     const result = classifyReconnectError(new Error("Failed to fetch"));
     expect(result.kind).toBe("transient");
     expect(result.userMessage).toBeUndefined();
+  });
+
+  it("classifies a vault key mismatch as actionable", () => {
+    const result = classifyReconnectError(new RemoteVaultKeyMismatchError("vault-1"));
+    expect(result.kind).toBe("actionable");
+    expect(result.userMessage).toBe(
+      "This device's vault key doesn't match the vault. Re-enter the vault password to resume syncing.",
+    );
   });
 
   it("classifies a RemoteVaultPasswordChangedError as actionable", () => {

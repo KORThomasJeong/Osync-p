@@ -45,10 +45,17 @@ function hasObsidianIcon(iconId: string): boolean {
   }
 }
 
+// `notSyncedHereCount`: files this device skipped or could not write. They never make
+// the state "attention needed"; the count only qualifies an "Up to date" headline.
 export function formatSyncStateHeadline(
   state: UserVisibleSyncState,
   statusLabel = "",
+  notSyncedHereCount = 0,
 ): string {
+  if (state === "up_to_date" && notSyncedHereCount > 0) {
+    const files = notSyncedHereCount === 1 ? "1 file" : `${notSyncedHereCount} files`;
+    return `Up to date · ${files} not synced here`;
+  }
   switch (state) {
     case "not_ready":
       return "Not ready";

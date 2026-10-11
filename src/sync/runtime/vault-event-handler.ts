@@ -22,6 +22,10 @@ export interface SyncVaultEventHandlerDeps {
   // Fired when a burst of live deletes crosses the threshold — a script/tool deleting many
   // files while Obsidian is open, which the reconcile-only mass-delete guard never sees.
   onDeleteBurst?: () => void;
+  // A syncable local path appeared (create / rename target) or went away (rename
+  // source / delete). Used for portability warnings; never affects syncing.
+  onLocalPathSeen?: (path: string) => void;
+  onLocalPathGone?: (path: string) => void;
   now?: () => number;
   deleteBurst?: { windowMs: number; threshold: number };
 }
@@ -35,6 +39,22 @@ export class SyncVaultEventHandler {
       windowMs: deps.deleteBurst?.windowMs ?? DEFAULT_DELETE_BURST_WINDOW_MS,
       threshold: deps.deleteBurst?.threshold ?? DEFAULT_DELETE_BURST_THRESHOLD,
     });
+  }
+
+  private notePathSeen(path: string): void {
+    try {
+      this.deps.onLocalPathSeen?.(path);
+    } catch (error) {
+      console.error("[osync] local path listener failed", error);
+    }
+  }
+
+  private notePathGone(path: string): void {
+    try {
+      this.deps.onLocalPathGone?.(path);
+    } catch (error) {
+      console.error("[osync] local path listener failed", error);
+    }
   }
 
   private noteDelete(): void {
@@ -54,6 +74,7 @@ export class SyncVaultEventHandler {
       plugin.app.vault.on("create", (file) => {
         const syncableFolder = this.deps.vaultAdapter.asSyncableFolder(file);
         if (syncableFolder) {
+          this.notePathSeen(syncableFolder.path);
           this.run(async () => {
             const changed = await this.deps.eventRecorder.recordFolderUpsert(syncableFolder.path);
             this.notifyLocalChangeIfNeeded(changed);
@@ -67,6 +88,7 @@ export class SyncVaultEventHandler {
           return;
         }
 
+        this.notePathSeen(path);
         this.run(async () => {
           await this.recordUpsert(path, syncableFile);
         });
@@ -89,8 +111,10 @@ export class SyncVaultEventHandler {
 
     plugin.registerEvent(
       plugin.app.vault.on("rename", (file, oldPath) => {
+        this.notePathGone(oldPath);
         const syncableFolder = this.deps.vaultAdapter.asSyncableFolder(file);
         if (syncableFolder) {
+          this.notePathSeen(syncableFolder.path);
           const renamedFromSyncable = this.deps.vaultAdapter.isSyncablePath(oldPath);
           this.run(async () => {
             if (renamedFromSyncable) {
@@ -110,6 +134,9 @@ export class SyncVaultEventHandler {
         const renamedToSyncable = !!syncableFile && !!nextPath;
         if (!renamedFromSyncable && !renamedToSyncable) {
           return;
+        }
+        if (nextPath) {
+          this.notePathSeen(nextPath);
         }
 
         this.run(async () => {
@@ -139,6 +166,7 @@ export class SyncVaultEventHandler {
 
     plugin.registerEvent(
       plugin.app.vault.on("delete", (file) => {
+        this.notePathGone(file.path);
         const syncableFolder = this.deps.vaultAdapter.asSyncableFolder(file);
         if (syncableFolder) {
           this.run(async () => {

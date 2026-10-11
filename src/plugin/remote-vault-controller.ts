@@ -4,6 +4,7 @@ import { BootstrapCollisionPreviewModal } from "./bootstrap-collision-preview-mo
 import { RemoteVaultManager } from "../remote-vault/manager";
 import { RemoteVaultPasswordChangedError } from "../remote-vault/types";
 import {
+  VAULT_KEY_MISMATCH_TEXT,
   openBootstrapPasswordChangedRetryModal,
   openBootstrapRemoteVaultModal,
   openChangeVaultPasswordModal,
@@ -158,6 +159,22 @@ export class OsyncRemoteVaultController {
           initialSyncMode: input.initialSyncMode ?? "download",
         });
       },
+    );
+  }
+
+  // The key saved on this device is not this vault's key: unwrap the right one from
+  // the vault password (stored per vault afterwards).
+  async promptVaultKeyReentry(input: { vaultId: string }): Promise<boolean> {
+    return await openBootstrapPasswordChangedRetryModal(
+      this.deps.plugin.app,
+      async (password) => {
+        await this.deps.remoteVaultManager.bootstrapRemoteVault({
+          vaultId: input.vaultId,
+          password,
+          initialSyncMode: "merge",
+        });
+      },
+      VAULT_KEY_MISMATCH_TEXT,
     );
   }
 

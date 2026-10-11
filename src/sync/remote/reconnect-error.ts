@@ -1,5 +1,8 @@
 import { RequestTimeoutError, SyncHttpError } from "../../http/request";
-import { RemoteVaultPasswordChangedError } from "../../remote-vault/types";
+import {
+  RemoteVaultKeyMismatchError,
+  RemoteVaultPasswordChangedError,
+} from "../../remote-vault/types";
 import { SyncRealtimeError } from "./realtime-types";
 
 export type ReconnectErrorKind = "transient" | "actionable";
@@ -12,6 +15,9 @@ export interface ReconnectErrorClassification {
 const SESSION_EXPIRED_MESSAGE = "Your session expired. Sign in again to resume syncing.";
 const PASSWORD_CHANGED_MESSAGE =
   "Your vault password changed. Reconnect the vault to resume syncing.";
+
+const KEY_MISMATCH_MESSAGE =
+  "This device's vault key doesn't match the vault. Re-enter the vault password to resume syncing.";
 
 const AUTH_CODE_FRAGMENTS = [
   "unauthorized",
@@ -32,6 +38,10 @@ export function classifyReconnectError(error: unknown): ReconnectErrorClassifica
       return { kind: "actionable", userMessage: SESSION_EXPIRED_MESSAGE };
     }
     return { kind: "transient" };
+  }
+
+  if (error instanceof RemoteVaultKeyMismatchError) {
+    return { kind: "actionable", userMessage: KEY_MISMATCH_MESSAGE };
   }
 
   if (error instanceof RemoteVaultPasswordChangedError) {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { setRequestUrlMock } from "obsidian";
 
 import { SyncAccessClient } from "./client";
+import { RemoteVaultKeyMismatchError } from "../../remote-vault/types";
 
 describe("SyncAccessClient", () => {
   afterEach(() => {
@@ -73,5 +74,22 @@ describe("SyncAccessClient", () => {
         localVaultId: "local-vault-1",
       }),
     ).rejects.toThrow("vault access denied");
+  });
+
+  it("maps 409 key_mismatch to RemoteVaultKeyMismatchError", async () => {
+    setRequestUrlMock(async () => ({
+      status: 409,
+      json: { error: "key_mismatch", code: "key_mismatch", message: "wrong key" },
+    }));
+
+    const client = new SyncAccessClient();
+
+    await expect(
+      client.issueSyncToken("http://127.0.0.1:8787", "session-token", {
+        vaultId: "vault-1",
+        localVaultId: "local-vault-1",
+        keyFingerprint: "fp-b",
+      }),
+    ).rejects.toBeInstanceOf(RemoteVaultKeyMismatchError);
   });
 });

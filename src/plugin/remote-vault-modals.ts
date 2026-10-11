@@ -44,11 +44,27 @@ export async function openChangeVaultPasswordModal(
   return await modal.openAndWait();
 }
 
+export interface PasswordRetryModalText {
+  title: string;
+  hint: string;
+}
+
+const PASSWORD_CHANGED_TEXT: PasswordRetryModalText = {
+  title: "Vault Password Changed",
+  hint: "The vault password changed on another device. Please enter the current password to reconnect this device.",
+};
+
+export const VAULT_KEY_MISMATCH_TEXT: PasswordRetryModalText = {
+  title: "Re-enter Vault Password",
+  hint: "The vault key saved on this device doesn't match this vault (it may belong to another vault on this device). Enter this vault's password to reconnect. Your local files are kept.",
+};
+
 export async function openBootstrapPasswordChangedRetryModal(
   app: App,
   reconnect: (newPassword: string) => Promise<void>,
+  text: PasswordRetryModalText = PASSWORD_CHANGED_TEXT,
 ): Promise<boolean> {
-  const modal = new BootstrapPasswordChangedRetryModal(app, reconnect);
+  const modal = new BootstrapPasswordChangedRetryModal(app, reconnect, text);
   return await modal.openAndWait();
 }
 
@@ -656,6 +672,7 @@ class BootstrapPasswordChangedRetryModal extends Modal {
   constructor(
     app: App,
     private readonly reconnect: (newPassword: string) => Promise<void>,
+    private readonly text: PasswordRetryModalText,
   ) {
     super(app);
   }
@@ -671,10 +688,10 @@ class BootstrapPasswordChangedRetryModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
 
-    contentEl.createEl("h2", { text: "Vault Password Changed" });
+    contentEl.createEl("h2", { text: this.text.title });
     contentEl.createEl("p", {
       cls: "osync-modal-hint",
-      text: "The vault password changed on another device. Please enter the current password to reconnect this device.",
+      text: this.text.hint,
     });
 
     let submitButton: { setDisabled(value: boolean): unknown } | null = null;

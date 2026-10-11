@@ -197,6 +197,7 @@ export class App {
 }
 
 export const Platform = {
+  isWin: false,
   isDesktop: true,
   isMobile: false,
   isDesktopApp: false,

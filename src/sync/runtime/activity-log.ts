@@ -15,7 +15,9 @@ export type SyncActivityKind =
   | "conflict"
   | "error"
   | "flush"
-  | "scan";
+  | "scan"
+  | "skip"
+  | "warning";
 
 export interface SyncActivityEntry {
   at: number;
@@ -52,6 +54,8 @@ const ACTIVITY_KINDS: ReadonlySet<string> = new Set<SyncActivityKind>([
   "error",
   "flush",
   "scan",
+  "skip",
+  "warning",
 ]);
 
 export class SyncActivityLog {

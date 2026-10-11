@@ -209,7 +209,7 @@ describe("SyncPullService failure rollback: apply", () => {
     await store.close();
   });
 
-  it("does not advance entry rows when a later path batch write fails", async () => {
+  it("isolates a failed path batch write to its own entry", async () => {
     const plugin = createTestPlugin();
     const store = await createInitializedTestSyncStore(plugin);
     const adapter = createVaultAdapter({
@@ -300,20 +300,29 @@ describe("SyncPullService failure rollback: apply", () => {
       onProgress: ignoreProgress,
     });
 
-    await expect(service.pullOnce(session)).rejects.toThrow("simulated vault write failure");
+    // One failed file write no longer throws the window (that re-downloaded the same
+    // blobs forever): the healthy entry applies, the cursor advances, and the failed
+    // entry records only its remote state while its local state stays untouched.
+    const result = await service.pullOnce(session);
+    expect(result.cursor).toBe(3);
+    expect(await store.getCursor()).toBe(3);
     expect(adapter.text("Folder/a.md")).toBe("new a");
     expect(adapter.text("Folder/b.md")).toBe("old b");
     expect(await store.getEntryById("entry-a")).toMatchObject({
       path: "Folder/a.md",
-      revision: 1,
-      blobId: "blob-a-old",
+      revision: 2,
+      blobId: "blob-a-new",
     });
-    expect(await store.getEntryById("entry-b")).toMatchObject({
+    expect(await store.getRemoteStateById("entry-b")).toMatchObject({
       path: "Folder/b.md",
-      revision: 1,
-      blobId: "blob-b-old",
+      revision: 2,
+      blobId: "blob-b-new",
     });
-    expect(await store.getCursor()).toBe(0);
+    expect(await store.getLocalStateById("entry-b")).toMatchObject({
+      path: "Folder/b.md",
+      blobId: "blob-b-old",
+      hash: "hash-b",
+    });
 
     await store.close();
   });

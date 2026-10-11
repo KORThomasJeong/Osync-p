@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_SYNC_FILE_RULES,
+  matchesSyncFileRules,
   normalizeExcludedFolders,
   normalizeSyncFileRules,
   shouldSyncPath,
@@ -149,5 +150,36 @@ describe("normalizeExcludedFolders", () => {
         ".git",
       ]),
     ).toEqual(["Archive", "Attachments/raw"]);
+  });
+});
+
+describe("device path policy", () => {
+  const longName = `notes/${"가".repeat(85)}.md`;
+  const windowsOnly = {
+    describeUnwritable: (path: string) => (path.includes("?") ? "Name not allowed" : null),
+  };
+
+  it("matchesSyncFileRules ignores device limits (user-configured rules only)", () => {
+    expect(matchesSyncFileRules(longName, DEFAULT_SYNC_FILE_RULES)).toBe(true);
+    expect(matchesSyncFileRules("notes/what?.md", DEFAULT_SYNC_FILE_RULES)).toBe(true);
+    expect(
+      matchesSyncFileRules("Archive/a.md", { ...DEFAULT_SYNC_FILE_RULES, excludedFolders: ["Archive"] }),
+    ).toBe(false);
+  });
+
+  it("shouldSyncPath treats a device-unwritable path like an excluded one", () => {
+    expect(shouldSyncPath("notes/what?.md", DEFAULT_SYNC_FILE_RULES, windowsOnly)).toBe(false);
+    expect(shouldSyncPath("notes/fine.md", DEFAULT_SYNC_FILE_RULES, windowsOnly)).toBe(true);
+  });
+
+  it("shouldSyncPath still honours user rules when a device policy is given", () => {
+    expect(
+      shouldSyncPath("Archive/a.md", { ...DEFAULT_SYNC_FILE_RULES, excludedFolders: ["Archive"] }, windowsOnly),
+    ).toBe(false);
+  });
+
+  it("shouldSyncPath without a device policy keeps the default path limits", () => {
+    expect(shouldSyncPath(longName, DEFAULT_SYNC_FILE_RULES)).toBe(false);
+    expect(shouldSyncPath("notes/what?.md", DEFAULT_SYNC_FILE_RULES)).toBe(true);
   });
 });

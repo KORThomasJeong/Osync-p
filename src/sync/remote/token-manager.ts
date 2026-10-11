@@ -8,6 +8,9 @@ export interface SyncTokenManagerDeps {
   getAuthSessionToken: () => string;
   getRemoteVaultId: () => string | null;
   getLocalVaultId: () => Promise<string>;
+  // Fingerprint of the vault key this device encrypts with. Sent with every token
+  // request so the server can refuse a device holding another vault's key.
+  getKeyFingerprint?: () => Promise<string | null>;
   syncAccessClient?: SyncAccessClient;
   now?: () => number;
 }
@@ -15,6 +18,7 @@ export interface SyncTokenManagerDeps {
 export class SyncTokenManager {
   private readonly syncAccessClient: SyncAccessClient;
   private cachedToken: SyncTokenResponse | null = null;
+  private cachedTokenKeyFingerprint: string | null = null;
 
   constructor(private readonly deps: SyncTokenManagerDeps) {
     this.syncAccessClient = deps.syncAccessClient ?? new SyncAccessClient();
@@ -36,7 +40,13 @@ export class SyncTokenManager {
       throw new Error("Local vault ID is not available.");
     }
 
-    if (this.cachedToken && this.canReuseToken(this.cachedToken, vaultId, localVaultId)) {
+    const keyFingerprint = (await this.deps.getKeyFingerprint?.()) ?? null;
+
+    if (
+      this.cachedToken &&
+      this.cachedTokenKeyFingerprint === keyFingerprint &&
+      this.canReuseToken(this.cachedToken, vaultId, localVaultId)
+    ) {
       return this.cachedToken;
     }
 
@@ -46,15 +56,18 @@ export class SyncTokenManager {
       {
         vaultId,
         localVaultId,
+        ...(keyFingerprint ? { keyFingerprint } : {}),
       },
     );
 
     this.cachedToken = issued;
+    this.cachedTokenKeyFingerprint = keyFingerprint;
     return issued;
   }
 
   clear(): void {
     this.cachedToken = null;
+    this.cachedTokenKeyFingerprint = null;
   }
 
   private canReuseToken(

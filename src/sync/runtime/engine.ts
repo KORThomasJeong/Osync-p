@@ -1,4 +1,4 @@
-import type { Plugin } from "obsidian";
+import { Platform, type Plugin } from "obsidian";
 
 import { hashBytes } from "../core/content";
 import { SyncAutoLoop } from "../engine/auto-sync";
@@ -39,6 +39,9 @@ import {
 import type { UserVisibleSyncState } from "./user-visible-status";
 import type { UserVisibleSyncProgress } from "./user-visible-status";
 import { SyncVaultEventHandler } from "./vault-event-handler";
+import { DeviceSyncIssues } from "./device-sync-issues";
+import type { PullDeviceIssueEvent } from "../engine/pull-entry-state-applier";
+import { writeVaultBytes } from "../vault/vault-writer";
 import {
   describeActivityError,
   type SyncActivityKind as SyncActivityLogKind,
@@ -49,6 +52,15 @@ import {
   SyncVersionHistoryService,
   type SyncEntryVersionsPage,
 } from "./version-history-service";
+import { RemoteVaultKeyMismatchError } from "../../remote-vault/types";
+import {
+  commitUnreadableRemovals,
+  detachLocalEntries,
+  scanUnreadableRemoteEntries,
+  type UnreadableRemoteEntry,
+  type UnreadableRemovalResult,
+  type UnreadableScanResult,
+} from "../engine/unreadable-entries";
 
 type SyncActivityKind = "push" | "pull" | "local";
 
@@ -87,7 +99,16 @@ export interface SyncEngineDeps {
   setStorageStatus: (status: SyncStorageStatus | null) => void;
   // Diagnostics trail (see activity-log.ts). Optional so tests can omit it.
   recordActivity?: (kind: SyncActivityLogKind, message: string) => void;
+  // Paths this device cannot hold + portability warnings. Defaults to an in-memory
+  // tracker for the current platform.
+  deviceSyncIssues?: DeviceSyncIssues;
+  // The server refused this device's vault key (it is another vault's key). Auto sync
+  // is already stopped; the caller must have the user re-enter the vault password.
+  onVaultKeyMismatch?: () => void;
 }
+
+// More new portability warnings than this in one go collapse into a single Notice.
+const MAX_INDIVIDUAL_PORTABILITY_NOTICES = 3;
 
 export class SyncEngine {
   private syncStore: SyncStore | null = null;
@@ -101,9 +122,16 @@ export class SyncEngine {
   private readonly syncEventGate = new SyncEventGate((path) =>
     this.syncVaultEventHandler.replayPath(path),
   );
+  private readonly deviceSyncIssues =
+    this.deps.deviceSyncIssues ?? new DeviceSyncIssues({ platform: { isWin: Platform.isWin } });
+  // Device issues first seen during the pull in progress (one Notice per pull).
+  private newDeviceIssuesThisPull = 0;
+  // Undecryptable entries first seen during the pull in progress (one log line per pull).
+  private newUnreadableThisPull = 0;
   private readonly vaultAdapter = new ObsidianSyncVaultAdapter(
     this.deps.plugin,
     () => this.deps.getSyncFileRules(),
+    () => this.deviceSyncIssues,
   );
   private readonly syncEventRecorder = new SyncEventRecorder({
     getSyncStore: () => this.syncStore,
@@ -133,6 +161,7 @@ export class SyncEngine {
     crypto: this.deps.crypto,
     shouldSyncPath: (path) => this.vaultAdapter.isSyncablePath(path),
     scanner: this.vaultAdapter,
+    onLocalFilesScanned: (paths) => this.notePortability(paths, { complete: true }),
   });
   private readonly syncAutoLoop = new SyncAutoLoop({
     getApiBaseUrl: () => this.deps.getApiBaseUrl(),
@@ -190,11 +219,19 @@ export class SyncEngine {
       console.error("[osync] sync error (escalated)", error);
       this.recordActivity("error", `Error (escalated): ${describeActivityError(error)}`);
       this.actionableAttention = true;
+      if (error instanceof RemoteVaultKeyMismatchError) {
+        // Retrying can never succeed and must not run with this key: stop until the
+        // user re-enters the vault password.
+        this.syncAutoLoop.stop();
+      }
       this.deps.setSyncStatus("attention_needed");
       const message = decision.message;
       if (message !== this.lastActionableMessage) {
         this.lastActionableMessage = message;
         this.deps.notify(message);
+      }
+      if (error instanceof RemoteVaultKeyMismatchError) {
+        this.deps.onVaultKeyMismatch?.();
       }
     },
   });
@@ -223,6 +260,8 @@ export class SyncEngine {
         "Osync: 대량 삭제가 감지되어 동기화를 일시정지했습니다. 의도한 삭제면 동기화를 재개하고, 아니면 서버에서 복원하세요.",
       );
     },
+    onLocalPathSeen: (path) => this.notePortability([path]),
+    onLocalPathGone: (path) => this.deviceSyncIssues.forgetLocalPath(path),
   });
   private readonly syncPullClient = new SyncPullClient(this.syncHttpClient);
   private readonly syncPullService = new SyncPullService({
@@ -234,6 +273,10 @@ export class SyncEngine {
     vaultAdapter: this.vaultAdapter,
     pullClient: this.syncPullClient,
     getSyncFileRules: () => this.deps.getSyncFileRules(),
+    getDevicePathPolicy: () => this.deviceSyncIssues,
+    onDeviceIssue: (event) => this.handleDeviceIssue(event),
+    onDecryptFailure: (entryId) => this.handleDecryptFailure(entryId),
+    onEntryDecrypted: (entryId) => this.deviceSyncIssues.forgetUnreadableEntry(entryId),
     onProgress: async (progress) => {
       this.reportActivityProgress(progress);
     },
@@ -617,9 +660,260 @@ export class SyncEngine {
 
   private async pullWithActivity(session: SyncRealtimeSession): Promise<PullOnceResult> {
     return await this.withSyncActivity("pull", async () => {
-      const result = await this.syncPullService.pullOnce(session);
-      this.recordPullResult(result);
-      return result;
+      this.newDeviceIssuesThisPull = 0;
+      this.newUnreadableThisPull = 0;
+      try {
+        const result = await this.syncPullService.pullOnce(session);
+        this.recordPullResult(result);
+        return result;
+      } finally {
+        this.notifyNewDeviceIssues();
+        this.notifyNewUnreadableEntries();
+      }
+    });
+  }
+
+  getDeviceSyncIssues(): DeviceSyncIssues {
+    return this.deviceSyncIssues;
+  }
+
+  // A file this device skipped or could not write never fails the pull and never
+  // needs attention; it is logged, listed in the status modal, and announced once.
+  private handleDeviceIssue(event: PullDeviceIssueEvent): void {
+    const isNew = this.deviceSyncIssues.applyPullEvent(event);
+    if (!isNew || event.kind === "resolved") {
+      return;
+    }
+    this.newDeviceIssuesThisPull += 1;
+    this.recordActivity("skip", `Not written on this device: ${event.path} (${event.reason})`);
+  }
+
+  // An entry this device's key cannot decrypt is quarantined by the pull (never applied,
+  // never a reason to delete anything). Recorded so it is visible, not silently skipped.
+  private handleDecryptFailure(entryId: string): void {
+    if (this.deviceSyncIssues.noteUnreadableEntry(entryId)) {
+      this.newUnreadableThisPull += 1;
+    }
+  }
+
+  private notifyNewUnreadableEntries(): void {
+    const count = this.newUnreadableThisPull;
+    this.newUnreadableThisPull = 0;
+    if (count === 0) {
+      return;
+    }
+    const entries = count === 1 ? "1 entry" : `${count} entries`;
+    this.recordActivity("error", `${entries} can't be decrypted with this vault's key`);
+    this.deps.notify(
+      `Osync: ${entries} on the server can't be decrypted with this vault's key. Run "Verify vault key" for details.`,
+    );
+  }
+
+  // Read-only scan of every server entry with this device's key (see
+  // unreadable-entries.ts). The result replaces the recorded unreadable entries.
+  async scanUnreadableRemoteEntries(
+    onProgress?: (scanned: number, total: number) => void,
+  ): Promise<UnreadableScanResult & { knownLocally: string[] }> {
+    const result = await this.withRealtimeSession(
+      async (session) =>
+        await scanUnreadableRemoteEntries({ session, crypto: this.deps.crypto, onProgress }),
+    );
+    this.deviceSyncIssues.replaceUnreadableEntries(
+      result.unreadable.map((entry) => entry.entryId),
+    );
+    const knownLocally: string[] = [];
+    const store = this.syncStore;
+    if (store) {
+      for (const entry of result.unreadable) {
+        const state = await store.getEntryStateById(entry.entryId);
+        if (state?.local && !state.local.deleted && state.local.path) {
+          knownLocally.push(entry.entryId);
+        }
+      }
+    }
+    return { ...result, knownLocally };
+  }
+
+  // Deletes unreadable entries on the server. Only call after confirming this
+  // device's key matches the vault's fingerprint. Local files are never touched: a
+  // removed entry this device still maps to a file is forgotten by the follow-up pull
+  // and the file re-uploads as a new entry.
+  async removeUnreadableRemoteEntries(
+    targets: readonly UnreadableRemoteEntry[],
+  ): Promise<UnreadableRemovalResult> {
+    const result = await this.withRealtimeSession(async (session) => {
+      const removal = await commitUnreadableRemovals({
+        session,
+        crypto: this.deps.crypto,
+        targets,
+      });
+      for (const entryId of removal.removed) {
+        this.deviceSyncIssues.forgetUnreadableEntry(entryId);
+      }
+      this.recordActivity(
+        "push",
+        `Removed ${removal.removed.length} unreadable entries from the server${
+          removal.failed.length > 0 ? `, ${removal.failed.length} failed` : ""
+        }`,
+      );
+      await this.pullWithActivity(session);
+      return removal;
+    });
+    await this.reconcileOnce();
+    this.syncAutoLoop.notifyLocalChange();
+    return result;
+  }
+
+  // Repair for a device that encrypted with the wrong key: its own entries on the
+  // server are unreadable now, but the files are plaintext on disk. Forget those
+  // entries locally (files untouched) so the scan uploads the files as new entries.
+  async reuploadUnreadableLocalEntries(entryIds: readonly string[]): Promise<number> {
+    const store = this.requireStore();
+    const detached = await this.runLocalMutationWork(
+      async () => await detachLocalEntries(store, entryIds),
+    );
+    await store.flush();
+    if (detached.length > 0) {
+      this.recordActivity(
+        "scan",
+        `Re-uploading ${detached.length} local file${detached.length === 1 ? "" : "s"} whose server entries were unreadable`,
+      );
+      await this.reconcileOnce();
+      this.syncAutoLoop.notifyLocalChange();
+    }
+    return detached.length;
+  }
+
+  private notifyNewDeviceIssues(): void {
+    const count = this.newDeviceIssuesThisPull;
+    this.newDeviceIssuesThisPull = 0;
+    if (count === 0) {
+      return;
+    }
+    const files = count === 1 ? "1 file" : `${count} files`;
+    this.deps.notify(
+      `Osync: ${files} couldn't be written on this device. Open sync status for details.`,
+    );
+  }
+
+  // Local files other platforms cannot hold still upload; warn once per path.
+  private notePortability(
+    paths: readonly string[],
+    options?: { complete?: boolean },
+  ): void {
+    const fresh = this.deviceSyncIssues.noteLocalPaths(paths, options);
+    for (const warning of fresh) {
+      this.recordActivity("warning", `Won't open on Windows: ${warning.path} (${warning.reason})`);
+    }
+    if (fresh.length > MAX_INDIVIDUAL_PORTABILITY_NOTICES) {
+      this.deps.notify(
+        `Osync: ${fresh.length} files can't be opened on Windows. Open sync status for details.`,
+      );
+      return;
+    }
+    for (const warning of fresh) {
+      this.deps.notify(
+        `Osync: "${warning.name}" can't be opened on Windows (${warning.reason}). Rename it to sync to Windows devices.`,
+      );
+    }
+  }
+
+  // Re-applies entries whose write failed on this device. The pull cursor is already
+  // past them, so instead of rewinding it we write the recorded remote state directly
+  // (download + verify + write), the same way the pull would have. Entries that fail
+  // again go back on the list. Returns how many were attempted and how many failed.
+  async retryUnwritablePaths(): Promise<{ retried: number; failed: number }> {
+    const store = this.requireStore();
+    const targets = this.deviceSyncIssues.takeWriteFailures();
+    let failed = 0;
+    for (const target of targets) {
+      try {
+        await this.runLocalMutationWork(async () => {
+          await this.reapplyRemoteEntry(store, target.entryId);
+        });
+        this.recordActivity("pull", `Retried write: ${target.path}`);
+      } catch (error) {
+        failed += 1;
+        const reason = describeActivityError(error);
+        console.error(`[osync] retry: could not write ${target.path}`, error);
+        this.deviceSyncIssues.applyPullEvent({
+          kind: "write_failed",
+          entryId: target.entryId,
+          path: target.path,
+          reason,
+        });
+        this.recordActivity("skip", `Retry failed: ${target.path} (${reason})`);
+      }
+    }
+    return { retried: targets.length, failed };
+  }
+
+  private async reapplyRemoteEntry(store: SyncStore, entryId: string): Promise<void> {
+    const remote = await store.getRemoteStateById(entryId);
+    if (!remote || remote.deleted || !remote.path) {
+      return; // Deleted or moved away since; nothing left to write here.
+    }
+    const path = remote.path;
+    if (!this.vaultAdapter.isSyncablePath(path)) {
+      // Excluded by the user's rules now, or a path this device can never hold.
+      const reason = this.deviceSyncIssues.describeUnwritable(path);
+      if (reason) {
+        this.deviceSyncIssues.applyPullEvent({ kind: "skipped", entryId, path, reason });
+      }
+      return;
+    }
+
+    if (remote.entryType === "folder") {
+      await this.syncEventGate.suppressPaths([path], async () => {
+        if (!(await this.vaultAdapter.exists(path))) {
+          await this.vaultAdapter.mkdir(path);
+        }
+      });
+      await store.applyLocalState({
+        entryId,
+        path,
+        blobId: null,
+        hash: null,
+        entryType: "folder",
+        deleted: false,
+        updatedAt: Date.now(),
+        localMtime: null,
+        localSize: null,
+      });
+      return;
+    }
+
+    if (!remote.blobId) {
+      return;
+    }
+    // While the path was device-excluded, local edits to an existing file there were
+    // not recorded. Never overwrite such an edit: leave it for the next scan, which
+    // now sees the path again and uploads it against the remote base.
+    const local = await store.getLocalStateById(entryId);
+    if (await this.vaultAdapter.exists(path)) {
+      const diskHash = await hashBytes(await this.vaultAdapter.readBytes(path));
+      if (diskHash !== remote.hash && diskHash !== local?.hash) {
+        return;
+      }
+    }
+
+    const bytes = await this.downloadAndDecryptVersionBlob(remote.blobId);
+    if (remote.hash && (await hashBytes(bytes)) !== remote.hash) {
+      throw new Error("Downloaded content did not match its recorded hash");
+    }
+    await this.syncEventGate.suppressPaths([path], async () => {
+      await writeVaultBytes(this.vaultAdapter, path, bytes);
+    });
+    await store.applyLocalState({
+      entryId,
+      path,
+      blobId: remote.blobId,
+      hash: remote.hash,
+      entryType: remote.entryType,
+      deleted: false,
+      updatedAt: Date.now(),
+      localMtime: null,
+      localSize: null,
     });
   }
 

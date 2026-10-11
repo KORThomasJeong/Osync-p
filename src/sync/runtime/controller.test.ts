@@ -7,6 +7,8 @@ import { MassDeleteGuardError } from "../engine/mass-delete-guard";
 import { SyncController } from "./controller";
 import { VaultKeyCryptoService } from "../core/crypto-service";
 import { SyncEngine } from "./engine";
+import type { DeviceSyncIssues } from "./device-sync-issues";
+import { RemoteVaultKeyMismatchError } from "../../remote-vault/types";
 
 describe("SyncController", () => {
   afterEach(() => {
@@ -148,6 +150,23 @@ describe("SyncController", () => {
       expect.any(SyncHttpError),
       "Auto sync initialization failed",
     );
+  });
+
+  it("stops and hands off to the password prompt when the server refuses the vault key", async () => {
+    vi.spyOn(SyncEngine.prototype, "runInitialPullIfRequired").mockRejectedValue(
+      new RemoteVaultKeyMismatchError("vault-1"),
+    );
+    const stopAutoSync = vi.spyOn(SyncEngine.prototype, "stopAutoSync");
+    const notifyError = vi.fn();
+    const onVaultKeyMismatch = vi.fn();
+
+    const controller = new SyncController(createDeps({ notifyError, onVaultKeyMismatch }));
+    await controller.ensureAutoSyncState();
+
+    expect(controller.getSyncState()).toBe("attention_needed");
+    expect(stopAutoSync).toHaveBeenCalled();
+    expect(onVaultKeyMismatch).toHaveBeenCalledTimes(1);
+    expect(notifyError).not.toHaveBeenCalled();
   });
 
   it("starts auto sync on resume when the loop is not active", async () => {
@@ -553,6 +572,100 @@ describe("SyncController", () => {
       const controller = new SyncController(createDeps());
 
       expect(await controller.getPendingUploadCount()).toBe(0);
+    });
+  });
+
+  describe("device sync issues", () => {
+    const issuesOf = (controller: SyncController) =>
+      (controller as unknown as { deviceSyncIssues: DeviceSyncIssues }).deviceSyncIssues;
+
+    it("exposes unwritable paths and portability warnings and notifies listeners", () => {
+      const controller = new SyncController(createDeps({ platform: { isWin: true } }));
+      const listener = vi.fn();
+      const unsubscribe = controller.onDeviceSyncIssuesChange(listener);
+
+      issuesOf(controller).applyPullEvent({
+        kind: "skipped",
+        entryId: "a",
+        path: "x?.md",
+        reason: "bad",
+      });
+      issuesOf(controller).noteLocalPaths(["y*.md"]);
+
+      expect(controller.getUnwritablePaths()).toEqual([
+        { path: "x?.md", reason: "bad", at: expect.any(Number) },
+      ]);
+      expect(controller.getPortabilityWarnings()).toEqual([
+        { path: "y*.md", reason: 'contains "*"' },
+      ]);
+      expect(listener).toHaveBeenCalledTimes(2);
+      unsubscribe();
+      issuesOf(controller).forgetLocalPath("y*.md");
+      expect(listener).toHaveBeenCalledTimes(2);
+    });
+
+    it("persists unwritable paths through the storage port", () => {
+      let saved: string | null = null;
+      const unwritablePathsStorage = {
+        load: () => saved,
+        save: (json: string) => {
+          saved = json;
+        },
+      };
+      const first = new SyncController(createDeps({ unwritablePathsStorage }));
+      issuesOf(first).applyPullEvent({ kind: "write_failed", entryId: "b", path: "b.md", reason: "x" });
+
+      const second = new SyncController(createDeps({ unwritablePathsStorage }));
+      expect(second.getUnwritablePaths().map((entry) => entry.path)).toEqual(["b.md"]);
+    });
+
+    it("counts unreadable entries, persists them, and reports changes to the same listeners", () => {
+      let saved: string | null = null;
+      const unreadableEntriesStorage = {
+        load: () => saved,
+        save: (json: string) => {
+          saved = json;
+        },
+      };
+      const controller = new SyncController(createDeps({ unreadableEntriesStorage }));
+      const listener = vi.fn();
+      controller.onDeviceSyncIssuesChange(listener);
+
+      issuesOf(controller).noteUnreadableEntry("e1");
+
+      expect(controller.getUnreadableEntryCount()).toBe(1);
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(
+        new SyncController(createDeps({ unreadableEntriesStorage })).getUnreadableEntryCount(),
+      ).toBe(1);
+    });
+
+    it("retries failed writes, then runs a catch-up check", async () => {
+      const retry = vi
+        .spyOn(SyncEngine.prototype, "retryUnwritablePaths")
+        .mockResolvedValue({ retried: 1, failed: 0 });
+      const controller = new SyncController(createDeps());
+      const checkNow = vi.spyOn(controller, "checkNow").mockResolvedValue();
+
+      await controller.retryUnwritablePaths();
+
+      expect(retry).toHaveBeenCalledTimes(1);
+      expect(checkNow).toHaveBeenCalledTimes(1);
+      expect(retry.mock.invocationCallOrder[0]).toBeLessThan(
+        checkNow.mock.invocationCallOrder[0] ?? 0,
+      );
+    });
+
+    it("surfaces a retry failure instead of throwing", async () => {
+      vi.spyOn(SyncEngine.prototype, "retryUnwritablePaths").mockRejectedValue(
+        new Error("Local sync store is not initialized."),
+      );
+      const notifyError = vi.fn();
+      const controller = new SyncController(createDeps({ notifyError }));
+
+      await controller.retryUnwritablePaths();
+
+      expect(notifyError).toHaveBeenCalledWith(expect.any(Error), "Retry failed");
     });
   });
 

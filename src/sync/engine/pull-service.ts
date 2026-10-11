@@ -3,6 +3,7 @@ import type { SyncEventGateLike } from "./event-gate";
 import { SyncPullClient } from "../remote/pull-client";
 import type { SyncCryptoService } from "../core/crypto-service";
 import type { SyncFileRules } from "../core/file-rules";
+import type { DevicePathPolicy } from "../core/path-portability";
 import type { SyncRealtimeSession } from "../remote/realtime-client";
 import type {
   SyncCursorStore,
@@ -11,6 +12,7 @@ import type {
 import type { SyncProgressCounts } from "../store/store";
 import {
   type PullConflictEvent,
+  type PullDeviceIssueEvent,
   PullEntryStateApplier,
   type PullEntryStateStore,
   type PullEntryStateManifestItem,
@@ -37,10 +39,14 @@ export interface SyncPullServiceDeps {
   // never be applied — undecryptable metadata, or a blob that fails decryption
   // or content-hash verification. Lets callers surface a diagnostic.
   onDecryptFailure?: (entryId: string) => void;
+  // Notified (best-effort) for every remote entry whose metadata decrypted.
+  onEntryDecrypted?: (entryId: string) => void;
   now?: () => number;
   isInitialDownloadSync?: () => Promise<boolean>;
   onInitialPullComplete?: () => Promise<void>;
   getSyncFileRules?: () => SyncFileRules;
+  getDevicePathPolicy?: () => DevicePathPolicy;
+  onDeviceIssue?: (event: PullDeviceIssueEvent) => void;
 }
 
 export interface SyncPullStore
@@ -75,8 +81,11 @@ export class SyncPullService {
       },
       onConflict: this.deps.onConflict,
       onDecryptFailure: this.deps.onDecryptFailure,
+      onEntryDecrypted: this.deps.onEntryDecrypted,
       now: this.deps.now,
       getSyncFileRules: this.deps.getSyncFileRules,
+      getDevicePathPolicy: this.deps.getDevicePathPolicy,
+      onDeviceIssue: this.deps.onDeviceIssue,
     });
   }
 

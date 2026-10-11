@@ -13,6 +13,7 @@ export interface OsyncCommandController {
   connectRemoteVaultFromPrompt(): Promise<void>;
   disconnectRemoteVault(): Promise<void>;
   changeVaultPasswordFromPrompt(): Promise<void>;
+  openVerifyVaultKey(): void;
   openVersionHistoryPane(): Promise<void>;
   openConflictResolutionPane(): Promise<void>;
   openSyncStatus(): void;
@@ -76,6 +77,20 @@ export function registerOsyncCommands(
     name: "Disconnect vault",
     callback: async () => {
       await controller.disconnectRemoteVault();
+    },
+  });
+
+  plugin.addCommand({
+    id: "verify-vault-key",
+    name: "Verify vault key",
+    checkCallback: (checking) => {
+      if (!controller.hasConnectedRemoteVault()) {
+        return false;
+      }
+      if (!checking) {
+        controller.openVerifyVaultKey();
+      }
+      return true;
     },
   });
 

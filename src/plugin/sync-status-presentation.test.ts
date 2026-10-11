@@ -52,6 +52,17 @@ describe("sync status formatting", () => {
     expect(formatSyncStateHeadline("syncing")).toBe("Syncing…");
   });
 
+  it("adds the not-synced-here count to the up-to-date headline only", () => {
+    expect(formatSyncStateHeadline("up_to_date", "", 1)).toBe(
+      "Up to date · 1 file not synced here",
+    );
+    expect(formatSyncStateHeadline("up_to_date", "", 3)).toBe(
+      "Up to date · 3 files not synced here",
+    );
+    expect(formatSyncStateHeadline("up_to_date", "", 0)).toBe("Up to date");
+    expect(formatSyncStateHeadline("checking", "", 2)).toBe("Checking…");
+  });
+
   it("formats the last server check, with never for null", () => {
     const now = 50_000_000;
     expect(formatLastServerCheck(null, now)).toBe("Last server check: never");

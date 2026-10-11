@@ -2,6 +2,7 @@ import { TFolder } from "obsidian";
 import type { Plugin, TAbstractFile, TFile } from "obsidian";
 
 import type { SyncFileRules } from "../core/file-rules";
+import type { DevicePathPolicy } from "../core/path-portability";
 import { asSyncableFile, asSyncableFolder, isSyncableVaultPath, toArrayBuffer } from "./vault-files";
 
 export interface SyncVaultFile {
@@ -15,14 +16,17 @@ export class ObsidianSyncVaultAdapter {
   constructor(
     private readonly plugin: Plugin,
     private readonly getSyncFileRules: () => SyncFileRules,
+    // Paths this device cannot hold are excluded like user-excluded ones (no events,
+    // no scan entry, and reconcile never turns their absence into a delete).
+    private readonly getDevicePathPolicy?: () => DevicePathPolicy,
   ) {}
 
   asSyncableFile(file: TAbstractFile): TFile | null {
-    return asSyncableFile(file, this.getSyncFileRules());
+    return asSyncableFile(file, this.getSyncFileRules(), this.getDevicePathPolicy?.());
   }
 
   asSyncableFolder(file: TAbstractFile): TFolder | null {
-    return asSyncableFolder(file, this.getSyncFileRules());
+    return asSyncableFolder(file, this.getSyncFileRules(), this.getDevicePathPolicy?.());
   }
 
   async isFolderEmpty(path: string): Promise<boolean> {
@@ -35,13 +39,13 @@ export class ObsidianSyncVaultAdapter {
       .getAllLoadedFiles()
       .filter(
         (f): f is TFolder =>
-          f instanceof TFolder && f.path !== "/" && isSyncableVaultPath(f.path, this.getSyncFileRules()),
+          f instanceof TFolder && f.path !== "/" && this.isSyncablePath(f.path),
       )
       .map((f) => f.path);
   }
 
   isSyncablePath(path: string): boolean {
-    return isSyncableVaultPath(path, this.getSyncFileRules());
+    return isSyncableVaultPath(path, this.getSyncFileRules(), this.getDevicePathPolicy?.());
   }
 
   async listFiles(): Promise<SyncVaultFile[]> {

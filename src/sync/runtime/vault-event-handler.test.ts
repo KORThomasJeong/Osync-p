@@ -100,6 +100,42 @@ describe("SyncVaultEventHandler", () => {
     expect(notifyLocalChange).not.toHaveBeenCalled();
   });
 
+  it("reports syncable local paths appearing and going away", async () => {
+    const callbacks: Partial<Record<VaultEventName, VaultEventCallback>> = {};
+    const plugin = createPlugin(callbacks);
+    const seen: string[] = [];
+    const gone: string[] = [];
+    const handler = new SyncVaultEventHandler({
+      plugin,
+      vaultAdapter: {
+        asSyncableFile: (file: TAbstractFile) => file as TFile,
+        asSyncableFolder: (_file: TAbstractFile) => null,
+        isSyncablePath: () => true,
+        readFile: async () => new Uint8Array(),
+      } as unknown as ObsidianSyncVaultAdapter,
+      eventRecorder: {
+        recordUpsert: vi.fn(async () => false),
+        recordRename: vi.fn(async () => false),
+        recordDelete: vi.fn(async () => false),
+      } satisfies Pick<SyncEventRecorder, "recordUpsert" | "recordRename" | "recordDelete">,
+      autoLoop: { notifyLocalChange: vi.fn() },
+      runLocalMutationWork: vi.fn(async (work: () => Promise<void>) => await work()),
+      hasActiveRemoteVaultSession: () => true,
+      onError: vi.fn(),
+      onLocalPathSeen: (path) => seen.push(path),
+      onLocalPathGone: (path) => gone.push(path),
+    });
+
+    handler.register();
+    callbacks.create?.(createFile("a?.md"));
+    callbacks.rename?.(createFile("a.md"), "a?.md");
+    callbacks.delete?.(createFile("a.md"));
+    await nextTask();
+
+    expect(seen).toEqual(["a?.md", "a.md"]);
+    expect(gone).toEqual(["a?.md", "a.md"]);
+  });
+
   it("fires onDeleteBurst when many deletes arrive in a short window", async () => {
     const callbacks: Partial<Record<"delete", VaultEventCallback>> = {};
     const plugin = createPlugin(callbacks);

@@ -8,6 +8,7 @@ describe("RemoteVaultManager offline restore", () => {
   it("still sets an active session when the bootstrap call rejects (offline)", async () => {
     const refreshUi = vi.fn();
     const storedVault: StoredRemoteVaultKeySecret = {
+      vaultId: "vault-offline",
       remoteVaultKey: new Uint8Array([4, 5, 6]),
     };
 
@@ -43,6 +44,7 @@ describe("RemoteVaultManager offline restore", () => {
 
   it("falls back to a placeholder summary when no cache is present and offline", async () => {
     const storedVault: StoredRemoteVaultKeySecret = {
+      vaultId: "vault-no-cache",
       remoteVaultKey: new Uint8Array([1, 1, 1]),
     };
 
@@ -71,6 +73,7 @@ describe("RemoteVaultManager offline restore", () => {
     const refreshUi = vi.fn();
     const saveCachedRemoteVaultSummary = vi.fn();
     const storedVault: StoredRemoteVaultKeySecret = {
+      vaultId: "vault-online",
       remoteVaultKey: new Uint8Array([7, 8, 9]),
     };
 
@@ -118,12 +121,14 @@ describe("RemoteVaultManager offline restore", () => {
       vaultId: "vault-online",
       vaultName: "Fresh Name",
       activeKeyVersion: 5,
+      keyFingerprint: null,
     });
   });
 
   it("does not overwrite a session that was cleared before bootstrap resolves", async () => {
     const saveCachedRemoteVaultSummary = vi.fn();
     const storedVault: StoredRemoteVaultKeySecret = {
+      vaultId: "vault-cleared",
       remoteVaultKey: new Uint8Array([2, 2, 2]),
     };
 

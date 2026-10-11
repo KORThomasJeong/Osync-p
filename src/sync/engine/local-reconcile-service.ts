@@ -44,6 +44,8 @@ export interface SyncLocalReconcileServiceDeps {
   scanner: LocalFileScanner;
   shouldSyncPath(path: string): boolean;
   prepareConcurrency?: number;
+  // Every syncable local file path of a completed scan (e.g. for portability warnings).
+  onLocalFilesScanned?: (paths: readonly string[]) => void;
 }
 
 export interface SyncLocalReconcileStore
@@ -82,6 +84,11 @@ export class SyncLocalReconcileService {
   }): Promise<ReconcileOnceResult> {
     const store = this.requireStore();
     const localFiles = await this.deps.scanner.listFiles();
+    try {
+      this.deps.onLocalFilesScanned?.(localFiles.map((file) => file.path));
+    } catch (error) {
+      console.error("[osync] reconcile: scan listener failed", error);
+    }
     // Membership is keyed by NFC path key: macOS scans return NFD while stored paths are
     // NFC, so a raw string compare treats the same file as missing and queues a ghost
     // delete. Keys normalize both sides; the original paths are still used for I/O.
