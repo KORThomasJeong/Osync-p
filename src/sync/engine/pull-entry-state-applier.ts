@@ -239,6 +239,15 @@ export class PullEntryStateApplier {
         } catch (error) {
           console.error("[osync] pull: decrypt listener failed", error);
         }
+        const malformed = describeMalformedEntryState(state, metadata);
+        if (malformed) {
+          // Like an undecryptable entry: applying it would throw for the whole window
+          // and stall the pull at this cursor forever. Skip it; nothing local changes.
+          console.error(
+            `[osync] pull: skipping malformed remote entry ${state.entryId} rev=${state.revision}: ${malformed}`,
+          );
+          return null;
+        }
         return { state, metadata };
       },
     );
@@ -826,6 +835,26 @@ export class PullEntryStateApplier {
 
     return await this.deps.eventGate.suppressPaths(uniqueSyncPaths(paths), action);
   }
+}
+
+// The invariants the manifest planner relies on (it throws when one is broken).
+function describeMalformedEntryState(
+  state: RemoteEntryState,
+  metadata: PullEntryStateManifestItem["metadata"],
+): string | null {
+  if (state.entryType === "folder") {
+    return null;
+  }
+  if (state.deleted) {
+    return metadata.hash !== null ? "deleted file has a hash" : null;
+  }
+  if (!state.blobId) {
+    return "file is missing a blob";
+  }
+  if (!metadata.hash) {
+    return "file is missing a hash";
+  }
+  return null;
 }
 
 function describeWriteError(error: unknown): string {

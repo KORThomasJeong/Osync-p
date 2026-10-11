@@ -198,4 +198,23 @@ describe("DeviceSyncIssues unreadable entries", () => {
       new DeviceSyncIssues({ platform: MAC, unreadableStorage: memoryStorage("{bad") }).getUnreadableEntryCount(),
     ).toBe(0);
   });
+
+  it("persists which key last confirmed the list, and still reads the plain id list", () => {
+    const unreadableStorage = memoryStorage();
+    const first = new DeviceSyncIssues({ platform: MAC, unreadableStorage });
+    expect(first.getUnreadableCheckedKey()).toBeNull();
+    first.noteUnreadableEntry("e1");
+    first.setUnreadableCheckedKey("fp-1");
+
+    const second = new DeviceSyncIssues({ platform: MAC, unreadableStorage });
+    expect(second.getUnreadableEntryIds()).toEqual(["e1"]);
+    expect(second.getUnreadableCheckedKey()).toBe("fp-1");
+
+    const legacy = new DeviceSyncIssues({
+      platform: MAC,
+      unreadableStorage: memoryStorage(JSON.stringify(["e7", "e8"])),
+    });
+    expect(legacy.getUnreadableEntryIds()).toEqual(["e7", "e8"]);
+    expect(legacy.getUnreadableCheckedKey()).toBeNull();
+  });
 });

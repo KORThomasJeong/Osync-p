@@ -23,6 +23,8 @@ import { toPathKey } from "../store/dexie/path-key";
 // - Unreadable entries: remote entries whose metadata or content this device's vault
 //   key cannot decrypt (written with another vault's key). The pull quarantines them
 //   and moves on, so they are persisted per vault — the cursor is already past them.
+//   Persisted with the fingerprint of the key that last confirmed them unreadable: a
+//   different key (the corrected one) makes every one of them worth fetching again.
 
 export const UNWRITABLE_PATHS_STORAGE_KEY = "osync.unwritablePaths";
 export const UNREADABLE_ENTRIES_STORAGE_KEY = "osync.unreadableEntries";
@@ -66,6 +68,7 @@ export class DeviceSyncIssues implements DevicePathPolicy {
   private records = new Map<string, UnwritableRecord>();
   private warnings = new Map<string, PortabilityWarning>();
   private unreadable = new Set<string>();
+  private unreadableCheckedKey: string | null = null;
   private readonly notifiedWarningKeys = new Set<string>();
   private readonly listeners = new Set<() => void>();
   private readonly now: () => number;
@@ -75,7 +78,9 @@ export class DeviceSyncIssues implements DevicePathPolicy {
     for (const record of this.loadPersisted()) {
       this.records.set(record.entryId, record);
     }
-    this.unreadable = new Set(this.loadPersistedUnreadable());
+    const persisted = this.loadPersistedUnreadable();
+    this.unreadable = new Set(persisted.ids);
+    this.unreadableCheckedKey = persisted.checkedWithKey;
   }
 
   // Returns true when the entry was not already recorded as unreadable.
@@ -111,6 +116,20 @@ export class DeviceSyncIssues implements DevicePathPolicy {
 
   getUnreadableEntryIds(): string[] {
     return [...this.unreadable].sort();
+  }
+
+  // Fingerprint of the vault key the recorded entries were last re-checked with
+  // (null: never). Re-checking with that same key cannot change the outcome.
+  getUnreadableCheckedKey(): string | null {
+    return this.unreadableCheckedKey;
+  }
+
+  setUnreadableCheckedKey(fingerprint: string | null): void {
+    if (this.unreadableCheckedKey === fingerprint) {
+      return;
+    }
+    this.unreadableCheckedKey = fingerprint;
+    this.unreadableChanged();
   }
 
   describeUnwritable(path: string): string | null {
@@ -247,7 +266,15 @@ export class DeviceSyncIssues implements DevicePathPolicy {
     const storage = this.options.unreadableStorage;
     if (storage) {
       try {
-        storage.save(JSON.stringify([...this.unreadable]));
+        const ids = [...this.unreadable];
+        // Plain id list unless a checked key is recorded (the format older versions read).
+        storage.save(
+          JSON.stringify(
+            this.unreadableCheckedKey === null
+              ? ids
+              : { ids, checkedWithKey: this.unreadableCheckedKey },
+          ),
+        );
       } catch (error) {
         console.warn("[osync] failed to persist unreadable entries", error);
       }
@@ -255,23 +282,33 @@ export class DeviceSyncIssues implements DevicePathPolicy {
     this.notifyListeners();
   }
 
-  private loadPersistedUnreadable(): string[] {
+  private loadPersistedUnreadable(): { ids: string[]; checkedWithKey: string | null } {
+    const empty = { ids: [], checkedWithKey: null };
     const storage = this.options.unreadableStorage;
     if (!storage) {
-      return [];
+      return empty;
     }
     try {
       const raw = storage.load();
       if (!raw) {
-        return [];
+        return empty;
       }
       const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed)
-        ? parsed.filter((value): value is string => typeof value === "string")
-        : [];
+      if (Array.isArray(parsed)) {
+        return { ids: onlyStrings(parsed), checkedWithKey: null };
+      }
+      if (typeof parsed === "object" && parsed !== null) {
+        const record = parsed as Record<string, unknown>;
+        return {
+          ids: Array.isArray(record.ids) ? onlyStrings(record.ids) : [],
+          checkedWithKey:
+            typeof record.checkedWithKey === "string" ? record.checkedWithKey : null,
+        };
+      }
+      return empty;
     } catch (error) {
       console.warn("[osync] failed to load unreadable entries", error);
-      return [];
+      return empty;
     }
   }
 
@@ -350,6 +387,10 @@ function sameWarnings(
     }
   }
   return true;
+}
+
+function onlyStrings(values: readonly unknown[]): string[] {
+  return values.filter((value): value is string => typeof value === "string");
 }
 
 function isUnwritableRecord(value: unknown): value is UnwritableRecord {

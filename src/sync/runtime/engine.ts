@@ -65,13 +65,17 @@ import {
 } from "./version-history-service";
 import { RemoteVaultKeyMismatchError } from "../../remote-vault/types";
 import {
+  applyRecoveredEntryStates,
   commitUnreadableRemovals,
   detachLocalEntries,
+  recoverUnreadableEntries,
   scanUnreadableRemoteEntries,
+  type UnreadableRecoveryResult,
   type UnreadableRemoteEntry,
   type UnreadableRemovalResult,
   type UnreadableScanResult,
 } from "../engine/unreadable-entries";
+import type { RemoteEntryState } from "../remote/changes";
 
 type SyncActivityKind = "push" | "pull" | "local";
 
@@ -116,6 +120,9 @@ export interface SyncEngineDeps {
   // The server refused this device's vault key (it is another vault's key). Auto sync
   // is already stopped; the caller must have the user re-enter the vault password.
   onVaultKeyMismatch?: () => void;
+  // Fingerprint of the vault key this device encrypts with (null without a session).
+  // A change makes entries quarantined under the previous key worth fetching again.
+  getKeyFingerprint?: () => Promise<string | null>;
 }
 
 // More new portability warnings than this in one go collapse into a single Notice.
@@ -141,6 +148,11 @@ export class SyncEngine {
   private newDeviceIssuesThisPull = 0;
   // Undecryptable entries first seen during the pull in progress (one log line per pull).
   private newUnreadableThisPull = 0;
+  // Applying re-fetched quarantined entries (already known unreadable: no new Notice).
+  private recoveringUnreadable = 0;
+  // Key of the last quarantine recovery this session, even a failed one: pulls retry
+  // only for another key; a manual check or the next start retries regardless.
+  private lastUnreadableRecoveryKey: string | null = null;
   // Queued local changes dropped because this key cannot decrypt them, and entries
   // forgotten so their files upload as new entries, not yet followed by the re-scan
   // that queues those files again.
@@ -756,6 +768,7 @@ export class SyncEngine {
       try {
         const result = await this.syncPullService.pullOnce(session);
         this.recordPullResult(result);
+        await this.recoverUnreadableEntriesAfterPull(session);
         return result;
       } finally {
         this.notifyNewDeviceIssues();
@@ -782,8 +795,128 @@ export class SyncEngine {
   // An entry this device's key cannot decrypt is quarantined by the pull (never applied,
   // never a reason to delete anything). Recorded so it is visible, not silently skipped.
   private handleDecryptFailure(entryId: string): void {
-    if (this.deviceSyncIssues.noteUnreadableEntry(entryId)) {
+    if (this.deviceSyncIssues.noteUnreadableEntry(entryId) && this.recoveringUnreadable === 0) {
       this.newUnreadableThisPull += 1;
+    }
+  }
+
+  // Entries a pull quarantined while this device held another key stay missing: the
+  // cursor is past them. Re-fetches their current server state and applies the ones
+  // that decrypt now through the pull path (see recoverUnreadableEntries). Without
+  // `force` this only runs when the key differs from the one that last checked them.
+  async recoverUnreadableEntries(
+    options: { force?: boolean } = {},
+  ): Promise<UnreadableRecoveryResult | null> {
+    if (this.deviceSyncIssues.getUnreadableEntryCount() === 0) {
+      return null;
+    }
+    return await this.withRealtimeSession(
+      async (session) =>
+        await this.withSyncActivity(
+          "pull",
+          async () => await this.runUnreadableRecovery(session, options.force ?? false),
+        ),
+    );
+  }
+
+  // After every pull: a changed key makes the whole quarantine list retry candidates.
+  // Never fails the pull; a failure is logged and retried on the next start or check.
+  private async recoverUnreadableEntriesAfterPull(session: SyncRealtimeSession): Promise<void> {
+    if (this.deviceSyncIssues.getUnreadableEntryCount() === 0) {
+      return;
+    }
+    try {
+      await this.runUnreadableRecovery(session, false);
+    } catch (error) {
+      console.error("[osync] unreadable recovery failed", error);
+      this.recordActivity(
+        "error",
+        `Re-fetching unreadable entries failed: ${describeActivityError(error)}`,
+      );
+    }
+  }
+
+  private async runUnreadableRecovery(
+    session: SyncRealtimeSession,
+    force: boolean,
+  ): Promise<UnreadableRecoveryResult | null> {
+    const entryIds = this.deviceSyncIssues.getUnreadableEntryIds();
+    if (entryIds.length === 0) {
+      return null;
+    }
+    const key = await this.readKeyFingerprint();
+    const keyChanged = key !== null && key !== this.deviceSyncIssues.getUnreadableCheckedKey();
+    if (!force && (!keyChanged || key === this.lastUnreadableRecoveryKey)) {
+      return null;
+    }
+    this.lastUnreadableRecoveryKey = key;
+
+    const result = await recoverUnreadableEntries({
+      session,
+      crypto: this.deps.crypto,
+      entryIds,
+      applyRemoteEntryStates: async (states) => await this.applyRecoveredStates(states),
+    });
+    for (const entryId of result.notFound) {
+      this.deviceSyncIssues.forgetUnreadableEntry(entryId);
+    }
+    this.settleRecoveredEntries(result, key, keyChanged);
+    return result;
+  }
+
+  // Applies through the pull applier. An entry whose content still fails to decrypt is
+  // listed again by it, without counting as newly unreadable (no Notice).
+  private async applyRecoveredStates(states: RemoteEntryState[]): Promise<void> {
+    this.recoveringUnreadable += 1;
+    try {
+      await this.syncPullService.applyRemoteEntryStates(states);
+    } finally {
+      this.recoveringUnreadable -= 1;
+    }
+  }
+
+  // Shared by the recovery and the key check once recovered states were applied: the
+  // applier unlisted every entry whose metadata decrypted and listed again any whose
+  // content still failed. A failed batch goes back on the list (its entries were
+  // unlisted before the batch failed) and keeps the key unconfirmed for a later retry.
+  private settleRecoveredEntries(
+    result: { applied: readonly string[]; failed: readonly string[] },
+    key: string | null,
+    keyChanged: boolean,
+  ): void {
+    for (const entryId of result.failed) {
+      this.deviceSyncIssues.noteUnreadableEntry(entryId);
+    }
+    if (result.failed.length === 0 && key !== null) {
+      this.deviceSyncIssues.setUnreadableCheckedKey(key);
+    }
+    const stillListed = new Set(this.deviceSyncIssues.getUnreadableEntryIds());
+    const recovered = result.applied.filter((entryId) => !stillListed.has(entryId)).length;
+    if (recovered > 0) {
+      const noun = recovered === 1 ? "entry" : "entries";
+      this.recordActivity(
+        "pull",
+        keyChanged
+          ? `Recovered ${recovered} ${noun} after key change`
+          : `Recovered ${recovered} previously unreadable ${noun}`,
+      );
+      // Applying may have rebased queued local changes: let the push pick them up.
+      this.syncAutoLoop.notifyLocalChange();
+    }
+    if (result.failed.length > 0) {
+      this.recordActivity(
+        "error",
+        `Couldn't re-fetch ${result.failed.length} unreadable entr${result.failed.length === 1 ? "y" : "ies"}; will retry`,
+      );
+    }
+  }
+
+  private async readKeyFingerprint(): Promise<string | null> {
+    try {
+      return (await this.deps.getKeyFingerprint?.()) ?? null;
+    } catch (error) {
+      console.warn("[osync] could not read the vault key fingerprint", error);
+      return null;
     }
   }
 
@@ -800,18 +933,46 @@ export class SyncEngine {
     );
   }
 
-  // Read-only scan of every server entry with this device's key (see
-  // unreadable-entries.ts). The result replaces the recorded unreadable entries.
+  // Scan of every server entry with this device's key (see unreadable-entries.ts).
+  // The result replaces the recorded unreadable entries; recorded entries that decrypt
+  // now are fetched and applied (the same recovery a key change triggers), not just
+  // unlisted, since the cursor is already past them.
   async scanUnreadableRemoteEntries(
     onProgress?: (scanned: number, total: number) => void,
   ): Promise<UnreadableScanResult & { knownLocally: string[] }> {
-    const result = await this.withRealtimeSession(
-      async (session) =>
-        await scanUnreadableRemoteEntries({ session, crypto: this.deps.crypto, onProgress }),
-    );
-    this.deviceSyncIssues.replaceUnreadableEntries(
-      result.unreadable.map((entry) => entry.entryId),
-    );
+    const listed = new Set(this.deviceSyncIssues.getUnreadableEntryIds());
+    const key = await this.readKeyFingerprint();
+    const keyChanged = key !== null && key !== this.deviceSyncIssues.getUnreadableCheckedKey();
+    const result = await this.withRealtimeSession(async (session) => {
+      const readable: RemoteEntryState[] = [];
+      const scan = await scanUnreadableRemoteEntries({
+        session,
+        crypto: this.deps.crypto,
+        onProgress,
+        onReadable:
+          listed.size > 0
+            ? (state) => {
+                if (listed.has(state.entryId)) {
+                  readable.push(state);
+                }
+              }
+            : undefined,
+      });
+      this.deviceSyncIssues.replaceUnreadableEntries(
+        scan.unreadable.map((entry) => entry.entryId),
+      );
+      if (readable.length > 0) {
+        await this.withSyncActivity("pull", async () => {
+          const applied = await applyRecoveredEntryStates(readable, async (states) =>
+            await this.applyRecoveredStates(states),
+          );
+          this.settleRecoveredEntries(applied, key, keyChanged);
+        });
+      } else if (key !== null) {
+        this.deviceSyncIssues.setUnreadableCheckedKey(key);
+      }
+      return scan;
+    });
     const knownLocally: string[] = [];
     const store = this.syncStore;
     if (store) {

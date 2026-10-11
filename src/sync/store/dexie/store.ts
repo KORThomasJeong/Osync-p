@@ -15,6 +15,7 @@ import type {
   SyncProgressCounts,
   SyncStore,
 } from "../store";
+import { MissingBaseBlobError } from "../store";
 import {
   METADATA_ID,
   MIN_PENDING_CREATED_AT,
@@ -581,9 +582,7 @@ export class DexieSyncStore implements SyncStore {
 
     const blob = await this.db.blobs.get(mutation.baseBlobId);
     if (!blob || blob.hash !== mutation.baseHash) {
-      throw new Error(
-        `Dirty entry ${mutation.entryId} requires cached base blob ${mutation.baseBlobId}.`,
-      );
+      throw new MissingBaseBlobError(mutation.entryId, mutation.baseBlobId);
     }
   }
 

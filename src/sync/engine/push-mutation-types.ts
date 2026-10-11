@@ -93,7 +93,9 @@ export interface PushMutationStore
 export interface SkippedPushMutation {
   skipped: true;
   // undecryptable: the queued row was dropped (see undecryptable-pending.ts).
-  reason: "file_too_large" | "storage_quota_exceeded" | "undecryptable";
+  // local_read_failed: the file could not be read now (locked, removed, no access); the
+  // change stays queued for a later push or the next scan.
+  reason: "file_too_large" | "storage_quota_exceeded" | "undecryptable" | "local_read_failed";
 }
 
 export type PreparePushMutationResult = PreparedPushMutation | SkippedPushMutation | null;

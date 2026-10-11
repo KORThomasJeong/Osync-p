@@ -107,6 +107,8 @@ export interface SyncControllerDeps {
   // The server refused this device's vault key. Sync is stopped; the user must
   // re-enter the vault password.
   onVaultKeyMismatch?: () => void;
+  // Fingerprint of the active vault key; a change re-fetches quarantined entries.
+  getKeyFingerprint?: () => Promise<string | null>;
   // Defaults to Obsidian's Platform (Windows rejects some file names).
   platform?: DevicePlatform;
 }
@@ -140,6 +142,7 @@ export class SyncController {
     recordActivity: (kind, message) => this.activityLog.record(kind, message),
     deviceSyncIssues: this.deviceSyncIssues,
     onVaultKeyMismatch: () => this.deps.onVaultKeyMismatch?.(),
+    getKeyFingerprint: async () => (await this.deps.getKeyFingerprint?.()) ?? null,
   });
   private readonly conflictQueue = new SyncConflictQueue();
   private startupRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -373,12 +376,26 @@ export class SyncController {
       if (!started) {
         await this.syncEngine.resumeAutoSyncConnection();
       }
+      await this.recoverUnreadableEntries();
     } catch (error) {
       this.activityLog.record("error", `Manual check failed: ${describeActivityError(error)}`);
       this.statusTracker.setStatus("attention_needed");
       this.deps.notifyError(error, "Sync check failed");
     } finally {
       this.activityLog.flush();
+    }
+  }
+
+  // A manual check also re-fetches entries quarantined as unreadable, whatever key
+  // last checked them (pulls only do so after a key change). Never throws.
+  private async recoverUnreadableEntries(): Promise<void> {
+    try {
+      await this.syncEngine.recoverUnreadableEntries({ force: true });
+    } catch (error) {
+      this.activityLog.record(
+        "error",
+        `Re-fetching unreadable entries failed: ${describeActivityError(error)}`,
+      );
     }
   }
 

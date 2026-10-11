@@ -1,6 +1,6 @@
 import type { SyncCryptoService } from "./crypto-service";
 import type { SyncMutationStore } from "../store/ports";
-import type { PendingMutationRow } from "../store/store";
+import { MissingBaseBlobError, type PendingMutationRow } from "../store/store";
 
 export type PendingMutationWriter = Pick<SyncMutationStore, "replaceDirtyEntry">;
 
@@ -84,6 +84,8 @@ export interface QueuedLocalUpsertMutation {
   entryId: string;
   blobId: string;
   mutation: PendingMutationRow;
+  // requireBaseBlob was set but the base blob is not cached: queued without a merge base.
+  baseBlobMissing: boolean;
 }
 
 export async function queueLocalUpsertMutation(
@@ -94,7 +96,7 @@ export async function queueLocalUpsertMutation(
   const baseRevision = input.base?.revision ?? 0;
   const blobId = createNextBlobId(input.previousLocal ?? input.base, input.hash);
   const pathToken = await input.crypto.derivePathToken(input.path);
-  const mutation = await replacePendingMutationForEntry(store, {
+  const replacement: ReplacePendingMutationInput = {
     entryId,
     op: "upsert",
     baseRevision,
@@ -117,12 +119,30 @@ export async function queueLocalUpsertMutation(
     ),
     requireBaseBlob: input.requireBaseBlob,
     pathToken,
-  });
+  };
+  let baseBlobMissing = false;
+  let mutation: PendingMutationRow;
+  try {
+    mutation = await replacePendingMutationForEntry(store, replacement);
+  } catch (error) {
+    if (!input.requireBaseBlob || !(error instanceof MissingBaseBlobError)) {
+      throw error;
+    }
+    // A missing merge base must never stop a local edit from being recorded (nor
+    // abort the scan recording it): queue it without one. The pull then has no
+    // cached base to merge with, so a conflict becomes a conflict copy.
+    baseBlobMissing = true;
+    mutation = await replacePendingMutationForEntry(store, {
+      ...replacement,
+      requireBaseBlob: false,
+    });
+  }
 
   return {
     entryId,
     blobId,
     mutation,
+    baseBlobMissing,
   };
 }
 

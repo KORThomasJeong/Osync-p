@@ -759,6 +759,25 @@ describe("SyncController", () => {
       expect(resumeAutoSyncConnection).not.toHaveBeenCalled();
     });
 
+    it("re-fetches quarantined entries, and a failure there does not fail the check", async () => {
+      const { resumeAutoSyncConnection } = mockRunningLoop();
+      const recover = vi
+        .spyOn(SyncEngine.prototype, "recoverUnreadableEntries")
+        .mockRejectedValue(new Error("offline"));
+      const controller = new SyncController(createDeps());
+
+      await controller.checkNow();
+
+      expect(recover).toHaveBeenCalledWith({ force: true });
+      expect(resumeAutoSyncConnection).toHaveBeenCalledTimes(1);
+      expect(controller.getSyncState()).not.toBe("attention_needed");
+      expect(
+        controller
+          .getActivityLog()
+          .some((entry) => entry.message.includes("Re-fetching unreadable entries failed")),
+      ).toBe(true);
+    });
+
     it("resolves and surfaces the failure instead of throwing", async () => {
       const { resumeAutoSyncConnection } = mockRunningLoop();
       resumeAutoSyncConnection.mockRejectedValue(new Error("boom"));

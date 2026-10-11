@@ -15,6 +15,7 @@ import type {
   SyncProgressCounts,
   SyncStore,
 } from "../sync/store/store";
+import { MissingBaseBlobError } from "../sync/store/store";
 
 export function createTestPlugin(): Plugin {
   let data: unknown = null;
@@ -448,9 +449,7 @@ class InMemorySyncStore implements SyncStore {
 
     const blob = this.cachedBlobs.get(mutation.baseBlobId);
     if (!blob || blob.hash !== mutation.baseHash) {
-      throw new Error(
-        `Dirty entry ${mutation.entryId} requires cached base blob ${mutation.baseBlobId}.`,
-      );
+      throw new MissingBaseBlobError(mutation.entryId, mutation.baseBlobId);
     }
   }
 }

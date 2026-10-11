@@ -13,6 +13,8 @@ export interface SyncVaultFile {
 }
 
 export class ObsidianSyncVaultAdapter {
+  private unscannedPaths = new Set<string>();
+
   constructor(
     private readonly plugin: Plugin,
     private readonly getSyncFileRules: () => SyncFileRules,
@@ -49,6 +51,7 @@ export class ObsidianSyncVaultAdapter {
   }
 
   async listFiles(): Promise<SyncVaultFile[]> {
+    this.unscannedPaths = new Set();
     const files = this.plugin.app.vault
       .getFiles()
       .filter((file) => this.isSyncablePath(file.path));
@@ -73,6 +76,12 @@ export class ObsidianSyncVaultAdapter {
     return result;
   }
 
+  // Paths (files, or folders with everything under them) the last listFiles() could not
+  // scan. They are not missing: the reconcile must not delete what it could not see.
+  listUnscannedPaths(): string[] {
+    return [...this.unscannedPaths].sort();
+  }
+
   private async listObsidianConfigFiles(): Promise<SyncVaultFile[]> {
     const result: SyncVaultFile[] = [];
     const queue = [".obsidian"];
@@ -82,7 +91,9 @@ export class ObsidianSyncVaultAdapter {
       let listed: { files: string[]; folders: string[] };
       try {
         listed = await this.plugin.app.vault.adapter.list(dir);
-      } catch {
+      } catch (error) {
+        console.warn(`[osync] scan: could not list ${dir}; leaving it as is`, error);
+        this.unscannedPaths.add(dir);
         continue;
       }
 
@@ -92,7 +103,14 @@ export class ObsidianSyncVaultAdapter {
 
       for (const path of listed.files) {
         if (!this.isSyncablePath(path)) continue;
-        const stat = await this.plugin.app.vault.adapter.stat(path);
+        let stat: { mtime: number; size: number } | null;
+        try {
+          stat = await this.plugin.app.vault.adapter.stat(path);
+        } catch (error) {
+          console.warn(`[osync] scan: could not stat ${path}; leaving it as is`, error);
+          this.unscannedPaths.add(path);
+          continue;
+        }
         if (!stat) continue;
         result.push({
           path,

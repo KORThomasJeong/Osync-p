@@ -41,6 +41,9 @@ export interface LocalSyncFile {
 export interface LocalFileScanner {
   listFiles(): Promise<LocalSyncFile[]>;
   listFolders(): string[];
+  // Paths (a file, or a folder and everything under it) the last listFiles() could not
+  // scan. Known entries there are left alone instead of being taken for deleted.
+  listUnscannedPaths?(): string[];
 }
 
 export interface SyncLocalReconcileServiceDeps {
@@ -112,6 +115,9 @@ export class SyncLocalReconcileService {
     // NFC, so a raw string compare treats the same file as missing and queues a ghost
     // delete. Keys normalize both sides; the original paths are still used for I/O.
     const localPathKeys = new Set(localFiles.map((file) => toPathKey(file.path)));
+    const isUnscanned = createUnscannedPathMatcher(
+      this.deps.scanner.listUnscannedPaths?.() ?? [],
+    );
     const knownEntries = await this.filterKnownEntries(store);
 
     if (!options?.allowMassDelete) {
@@ -127,7 +133,7 @@ export class SyncLocalReconcileService {
           if (!localFolderPathKeys.has(toPathKey(entry.path))) {
             deleteCandidates += 1;
           }
-        } else if (!localPathKeys.has(toPathKey(entry.path))) {
+        } else if (!localPathKeys.has(toPathKey(entry.path)) && !isUnscanned(entry.path)) {
           deleteCandidates += 1;
         }
       }
@@ -150,6 +156,7 @@ export class SyncLocalReconcileService {
     );
 
     // Phase 1: parallel read + hash
+    const unreadablePaths: string[] = [];
     const prepared = await mapWithConcurrency(
       localFiles,
       this.deps.prepareConcurrency ?? DEFAULT_PREPARE_CONCURRENCY,
@@ -161,16 +168,33 @@ export class SyncLocalReconcileService {
         if (!existingHasPendingDelete && canSkipHash(existing, file)) {
           return { file, existing, pendingDeleteEntry, hash: null };
         }
-        const hash = await hashBytes(await file.readBytes());
+        let bytes: Uint8Array;
+        try {
+          bytes = await file.readBytes();
+        } catch (error) {
+          // One file that cannot be read right now (locked, removed since the listing,
+          // no access) must not abort the scan. It still counts as present, so nothing
+          // is deleted for it; the next scan or its next vault event picks it up.
+          unreadablePaths.push(file.path);
+          console.debug("[osync] reconcile: read failed", file.path, error);
+          return { file, existing, pendingDeleteEntry, hash: null };
+        }
+        const hash = await hashBytes(bytes);
         return { file, existing, pendingDeleteEntry, hash };
       },
     );
+    if (unreadablePaths.length > 0) {
+      console.warn(
+        `[osync] reconcile: could not read ${unreadablePaths.length} file(s); skipped this scan (e.g. ${unreadablePaths[0]})`,
+      );
+    }
 
     // Phase 2: sequential application
     const renameCandidates = new Map<string, LocalSyncEntryRow[]>();
     const reusedEntryIds = new Set<string>();
     let filesQueuedForUpsert = 0;
     let filesQueuedForDelete = 0;
+    const queuedWithoutMergeBase: string[] = [];
 
     for (const entry of knownEntries) {
       if (
@@ -234,6 +258,9 @@ export class SyncLocalReconcileService {
         editedAt: resolveEditedAt({ now: () => Date.now(), fileMtime: file.mtime }),
         requireBaseBlob: shouldRequireBaseBlob(file.path, remote),
       });
+      if (queued.baseBlobMissing) {
+        queuedWithoutMergeBase.push(file.path);
+      }
       await store.applyLocalState({
         entryId: queued.entryId,
         path: file.path,
@@ -246,12 +273,18 @@ export class SyncLocalReconcileService {
       });
       filesQueuedForUpsert += 1;
     }
+    if (queuedWithoutMergeBase.length > 0) {
+      console.warn(
+        `[osync] reconcile: ${queuedWithoutMergeBase.length} edited note(s) queued without a cached merge base blob; a conflict on them becomes a conflict copy (e.g. ${queuedWithoutMergeBase[0]})`,
+      );
+    }
 
     for (const entry of knownEntries) {
       if (
         entry.deleted ||
         !entry.path ||
         localPathKeys.has(toPathKey(entry.path)) ||
+        isUnscanned(entry.path) ||
         reusedEntryIds.has(entry.entryId) ||
         entry.entryType === "folder"
       ) {
@@ -470,6 +503,17 @@ async function getVisibleRemoteEntryByPath(
 ): Promise<RemoteSyncEntryRow | null> {
   const visible = await store.getEntryByPath(path);
   return visible ? await store.getRemoteStateById(visible.entryId) : null;
+}
+
+function createUnscannedPathMatcher(paths: readonly string[]): (path: string) => boolean {
+  if (paths.length === 0) {
+    return () => false;
+  }
+  const keys = paths.map((path) => toPathKey(path));
+  return (path) => {
+    const key = toPathKey(path);
+    return keys.some((prefix) => key === prefix || key.startsWith(`${prefix}/`));
+  };
 }
 
 function shouldRequireBaseBlob(

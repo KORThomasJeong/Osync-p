@@ -4,6 +4,7 @@ import { TFile as ObsidianTFile } from "obsidian";
 import { describe, expect, it, vi } from "vitest";
 
 import { encodeUtf8, hashBytes } from "../core/content";
+import { encryptSyncMetadata } from "../core/crypto";
 import { DEFAULT_SYNC_FILE_RULES } from "../core/file-rules";
 import type { SyncTokenResponse } from "../remote/client";
 import { createInitializedTestSyncStore } from "../../test-support/test-plugin";
@@ -766,6 +767,166 @@ describe("SyncEngine", () => {
       pullServiceOf(engine).deps.onEntryDecrypted("e1");
 
       expect(deviceSyncIssues.getUnreadableEntryCount()).toBe(0);
+    });
+
+    describe("recovering quarantined entries", () => {
+      const WRONG_KEY = new Uint8Array(32).fill(7);
+
+      async function entryState(entryId: string, key: Uint8Array, cursor: number) {
+        return {
+          entryId,
+          revision: 1,
+          blobId: null,
+          deleted: false,
+          updatedSeq: cursor,
+          updatedAt: cursor,
+          entryType: "folder" as const,
+          encryptedMetadata: await encryptSyncMetadata(
+            key,
+            { path: `Folder-${entryId}`, hash: null },
+            { entryId, revision: 1, op: "upsert", blobId: null },
+          ),
+        };
+      }
+
+      // e1 decrypts with the (corrected) key now, e2 still does not.
+      async function serverSession() {
+        const states = [
+          await entryState("e1", TEST_VAULT_KEY, 1),
+          await entryState("e2", WRONG_KEY, 2),
+          await entryState("e3", TEST_VAULT_KEY, 3),
+        ];
+        const listEntryStates = vi.fn(async () => ({
+          targetCursor: 3,
+          totalEntries: states.length,
+          hasMore: false,
+          nextAfter: null,
+          entries: states,
+        }));
+        return { listEntryStates };
+      }
+
+      function arrange(options: { checkedKey: string | null; key: string }) {
+        const recordActivity = vi.fn();
+        const notify = vi.fn();
+        const deviceSyncIssues = new DeviceSyncIssues({ platform: { isWin: false } });
+        deviceSyncIssues.noteUnreadableEntry("e1");
+        deviceSyncIssues.noteUnreadableEntry("e2");
+        deviceSyncIssues.setUnreadableCheckedKey(options.checkedKey);
+        const engine = createEngine(createPlugin({}, async () => encodeUtf8("")), {
+          recordActivity,
+          notify,
+          deviceSyncIssues,
+          getKeyFingerprint: async () => options.key,
+        });
+        const pull = pullServiceOf(engine) as ReturnType<typeof pullServiceOf> & {
+          applyRemoteEntryStates: (states: Array<{ entryId: string }>) => Promise<void>;
+        };
+        vi.spyOn(pull, "pullOnce").mockResolvedValue(emptyPull);
+        // Like the real applier: an entry whose metadata decrypts is no longer unreadable.
+        const apply = vi
+          .spyOn(pull, "applyRemoteEntryStates")
+          .mockImplementation(async (states) => {
+            for (const state of states) {
+              pull.deps.onEntryDecrypted(state.entryId);
+            }
+          });
+        return { engine, deviceSyncIssues, recordActivity, notify, apply };
+      }
+
+      it("re-fetches every quarantined entry once the vault key changed, and logs the recovery", async () => {
+        const { engine, deviceSyncIssues, recordActivity, notify, apply } = arrange({
+          checkedKey: "fp-wrong",
+          key: "fp-right",
+        });
+        const session = await serverSession();
+
+        await loopOf(engine).deps.pullOnce(session);
+
+        expect(apply).toHaveBeenCalledTimes(1);
+        expect(apply.mock.calls[0]![0].map((state) => state.entryId)).toEqual(["e1"]);
+        expect(deviceSyncIssues.getUnreadableEntryIds()).toEqual(["e2"]);
+        expect(deviceSyncIssues.getUnreadableCheckedKey()).toBe("fp-right");
+        expect(recordActivity).toHaveBeenCalledWith("pull", "Recovered 1 entry after key change");
+        expect(notify).not.toHaveBeenCalled();
+
+        // Same key on the next pull: the remaining entry cannot decrypt any better.
+        await loopOf(engine).deps.pullOnce(session);
+        expect(session.listEntryStates).toHaveBeenCalledTimes(1);
+      });
+
+      it("re-checks a list recorded before key tracking existed on the first pull", async () => {
+        const { engine, deviceSyncIssues, apply } = arrange({ checkedKey: null, key: "fp-right" });
+
+        await loopOf(engine).deps.pullOnce(await serverSession());
+
+        expect(apply).toHaveBeenCalledTimes(1);
+        expect(deviceSyncIssues.getUnreadableEntryIds()).toEqual(["e2"]);
+      });
+
+      it("does not re-fetch on a pull when the key already re-checked them", async () => {
+        const { engine, apply } = arrange({ checkedKey: "fp-right", key: "fp-right" });
+        const session = await serverSession();
+
+        await loopOf(engine).deps.pullOnce(session);
+
+        expect(session.listEntryStates).not.toHaveBeenCalled();
+        expect(apply).not.toHaveBeenCalled();
+      });
+
+      it("re-fetches on request (manual check) even with the same key", async () => {
+        const { engine, deviceSyncIssues, recordActivity } = arrange({
+          checkedKey: "fp-right",
+          key: "fp-right",
+        });
+        const session = await serverSession();
+        vi.spyOn(loopOf(engine) as unknown as { withRealtimeSession: (work: unknown) => unknown }, "withRealtimeSession")
+          .mockImplementation(async (work) => await (work as (s: unknown) => Promise<unknown>)(session));
+
+        const result = await engine.recoverUnreadableEntries({ force: true });
+
+        expect(result?.applied).toEqual(["e1"]);
+        expect(deviceSyncIssues.getUnreadableEntryIds()).toEqual(["e2"]);
+        expect(recordActivity).toHaveBeenCalledWith("pull", "Recovered 1 previously unreadable entry");
+      });
+
+      it("keeps entries listed and retries later when applying them failed", async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        const { engine, deviceSyncIssues, apply } = arrange({
+          checkedKey: "fp-wrong",
+          key: "fp-right",
+        });
+        apply.mockImplementation(async (states) => {
+          for (const state of states) {
+            pullServiceOf(engine).deps.onEntryDecrypted(state.entryId);
+          }
+          throw new Error("network down");
+        });
+
+        await loopOf(engine).deps.pullOnce(await serverSession());
+
+        expect(deviceSyncIssues.getUnreadableEntryIds()).toEqual(["e1", "e2"]);
+        expect(deviceSyncIssues.getUnreadableCheckedKey()).toBe("fp-wrong");
+      });
+
+      it("fetches entries the key check finds readable again instead of just unlisting them", async () => {
+        const { engine, deviceSyncIssues, recordActivity, apply } = arrange({
+          checkedKey: "fp-wrong",
+          key: "fp-right",
+        });
+        const session = await serverSession();
+        vi.spyOn(loopOf(engine) as unknown as { withRealtimeSession: (work: unknown) => unknown }, "withRealtimeSession")
+          .mockImplementation(async (work) => await (work as (s: unknown) => Promise<unknown>)(session));
+
+        const scan = await engine.scanUnreadableRemoteEntries();
+
+        expect(scan.unreadable.map((entry) => entry.entryId)).toEqual(["e2"]);
+        expect(apply).toHaveBeenCalledTimes(1);
+        expect(apply.mock.calls[0]![0].map((state) => state.entryId)).toEqual(["e1"]);
+        expect(deviceSyncIssues.getUnreadableEntryIds()).toEqual(["e2"]);
+        expect(deviceSyncIssues.getUnreadableCheckedKey()).toBe("fp-right");
+        expect(recordActivity).toHaveBeenCalledWith("pull", "Recovered 1 entry after key change");
+      });
     });
   });
 

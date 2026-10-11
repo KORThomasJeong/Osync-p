@@ -100,6 +100,7 @@ export class SyncEventRecorder {
       editedAt: resolveEditedAt({ now: () => Date.now(), fileMtime: localStat?.mtime }),
       requireBaseBlob: shouldRequireBaseBlob(path, remote),
     });
+    warnIfQueuedWithoutMergeBase(queued, path);
     const nextEntry = buildLocalEntrySnapshot(existing, {
       entryId: queued.entryId,
       path,
@@ -166,6 +167,7 @@ export class SyncEventRecorder {
       editedAt: resolveEditedAt({ now: () => Date.now(), fileMtime: localStat?.mtime }),
       requireBaseBlob: shouldRequireBaseBlob(nextPath, remote),
     });
+    warnIfQueuedWithoutMergeBase(queued, nextPath);
     await store.applyLocalState(
       buildLocalEntrySnapshot(existing, {
         path: nextPath,
@@ -399,4 +401,15 @@ function shouldRequireBaseBlob(
   remote: RemoteSyncEntryRow | null,
 ): boolean {
   return !!remote && !remote.deleted && !!remote.blobId && isAutoMergeTextPath(path);
+}
+
+function warnIfQueuedWithoutMergeBase(
+  queued: { baseBlobMissing: boolean },
+  path: string,
+): void {
+  if (queued.baseBlobMissing) {
+    console.warn(
+      `[osync] recorder: ${path} queued without a cached merge base blob; a conflict on it becomes a conflict copy`,
+    );
+  }
 }

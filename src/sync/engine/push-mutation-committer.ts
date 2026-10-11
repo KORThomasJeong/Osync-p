@@ -114,17 +114,27 @@ export class PushMutationCommitter {
       };
     }
 
-    const bytes = await this.deps.fileReader.readBytes(metadata.path);
-    if (!mutation.blobId) {
-      throw new Error(`Upsert mutation ${mutation.mutationId} is missing a blobId.`);
-    }
-    if (!mutation.hash) {
-      throw new Error(`Upsert mutation ${mutation.mutationId} is missing a hash.`);
-    }
-    if (metadata.hash !== mutation.hash) {
-      throw new Error(`Upsert mutation ${mutation.mutationId} metadata hash does not match.`);
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.deps.fileReader.readBytes(metadata.path);
+    } catch (error) {
+      // One unreadable file must not fail the whole push: keep its change queued.
+      console.warn(
+        `[osync] push: could not read ${metadata.path}; its change stays queued`,
+        error,
+      );
+      return { skipped: true, reason: "local_read_failed" };
     }
     const actualHash = await hashBytes(bytes);
+    if (!mutation.blobId || !mutation.hash || metadata.hash !== mutation.hash) {
+      // A malformed queued row would fail every push forever (and hold up every change
+      // queued after it). Rebuild it from the file on disk instead.
+      console.warn(
+        `[osync] push: queued change ${mutation.mutationId} is malformed (blobId=${mutation.blobId ?? "null"} hash=${mutation.hash ? "set" : "null"}); re-queuing it from the file`,
+      );
+      await this.requeueChangedUpsert(store, mutation, metadata.path, actualHash);
+      return null;
+    }
     if (actualHash !== mutation.hash) {
       await this.requeueChangedUpsert(store, mutation, metadata.path, actualHash);
       return null;

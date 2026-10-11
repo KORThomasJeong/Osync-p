@@ -131,6 +131,8 @@ export class SyncPushService {
     let processedMutations = 0;
     let hasMore = false;
     let stopAfterCurrentBatch = false;
+    // Queued changes whose local file could not be read during this push.
+    const unreadable = new Set<string>();
 
     try {
       if (
@@ -142,9 +144,11 @@ export class SyncPushService {
 
       while (processedMutations < DEFAULT_PUSH_DRAIN_LIMIT) {
         const remainingBudget = DEFAULT_PUSH_DRAIN_LIMIT - processedMutations;
-        const pending = await store.listDirtyEntries(
-          Math.min(DEFAULT_PUSH_BATCH, remainingBudget),
-        );
+        const batchSize = Math.min(DEFAULT_PUSH_BATCH, remainingBudget);
+        // Changes whose file could not be read are not retried within this push.
+        const pending = (await store.listDirtyEntries(batchSize + unreadable.size))
+          .filter((mutation) => !unreadable.has(mutation.mutationId))
+          .slice(0, batchSize);
         if (pending.length === 0) {
           hasMore = false;
           break;
@@ -177,6 +181,9 @@ export class SyncPushService {
           if ("skipped" in prepared) {
             if (prepared.reason === "undecryptable") {
               mutationsDropped += 1;
+            }
+            if (prepared.reason === "local_read_failed") {
+              unreadable.add(mutation.mutationId);
             }
             continue;
           }
@@ -259,7 +266,9 @@ export class SyncPushService {
         }
       }
 
-      hasMore = (await store.listDirtyEntries(1)).length > 0;
+      hasMore = (await store.listDirtyEntries(unreadable.size + 1)).some(
+        (mutation) => !unreadable.has(mutation.mutationId),
+      );
     } finally {
       await store.flush();
     }

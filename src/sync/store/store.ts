@@ -93,6 +93,19 @@ export interface MarkEntryDirtyOptions {
   requireBaseBlob?: boolean;
 }
 
+// Thrown by markEntryDirty/replaceDirtyEntry with requireBaseBlob when the mutation's
+// base blob (the 3-way text merge base) is not cached. Callers queuing a local edit
+// treat it as non-fatal and queue the change without a merge base.
+export class MissingBaseBlobError extends Error {
+  constructor(
+    readonly entryId: string,
+    readonly baseBlobId: string,
+  ) {
+    super(`Dirty entry ${entryId} requires cached base blob ${baseBlobId}.`);
+    this.name = "MissingBaseBlobError";
+  }
+}
+
 export interface SyncConnection {
   localVaultId: string;
   remoteVaultId: string;

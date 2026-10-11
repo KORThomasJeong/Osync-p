@@ -142,6 +142,7 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
     onVaultKeyMismatch: () => {
       void this.handleServerKeyMismatch();
     },
+    getKeyFingerprint: async () => await this.remoteVaultManager.getActiveKeyFingerprint(),
     getApiBaseUrl: () => this.getApiBaseUrl(),
     getSyncToken: async () => await this.getSyncTokenForActiveRemoteVault(),
     invalidateSyncToken: () => {

@@ -1,14 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { decryptSyncMetadata, encryptSyncMetadata } from "../core/crypto";
 import { VaultKeyCryptoService } from "../core/crypto-service";
 import type { CommitMutationPayload, SyncRealtimeSession } from "../remote/realtime-client";
 import { SyncLocalReconcileService } from "./local-reconcile-service";
 import { SyncPullService } from "./pull-service";
+import type { RemoteEntryState } from "../remote/changes";
+import type { SyncStore } from "../store/store";
 import {
   commitUnreadableRemovals,
   detachLocalEntries,
   isUnreadablePlaceholderPath,
+  recoverUnreadableEntries,
   scanUnreadableRemoteEntries,
   unreadablePlaceholderPath,
 } from "./unreadable-entries";
@@ -23,10 +26,17 @@ import {
   createRealtimeSession,
   createToken,
   createVaultAdapter,
+  encryptPendingMetadata,
+  encryptRemoteMetadata,
+  encryptTestBlob,
   hashText,
   ignoreProgress,
   TEST_VAULT_KEY,
 } from "./__tests__/pull-service/helpers";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const WRONG_KEY = new Uint8Array(32).fill(7);
 const crypto = new VaultKeyCryptoService(() => TEST_VAULT_KEY);
@@ -275,6 +285,185 @@ describe("repair after reconnecting with the correct key", () => {
     expect(adapter.text("Notes/written-with-wrong-key.md")).toBe("iphone note");
     expect(adapter.text("Notes/readable.md")).toBe("shared note");
     expect(await store.listDirtyEntries()).toHaveLength(1);
+    await store.close();
+  });
+});
+
+async function readableCommit(input: {
+  cursor: number;
+  entryId: string;
+  path: string;
+  body: string;
+}) {
+  const blobId = `blob-${input.entryId}`;
+  return createCommit({
+    cursor: input.cursor,
+    entryId: input.entryId,
+    revision: 1,
+    blobId,
+    encryptedMetadata: await encryptRemoteMetadata({
+      entryId: input.entryId,
+      revision: 1,
+      blobId,
+      path: input.path,
+      hash: await hashText(input.body),
+    }),
+  });
+}
+
+async function queueLocalNewFile(store: SyncStore, entryId: string, path: string, body: string) {
+  const hash = await hashText(body);
+  await store.upsertEntry({
+    entryId,
+    path,
+    revision: 0,
+    blobId: `blob-${entryId}`,
+    hash,
+    deleted: false,
+    updatedAt: 1,
+  });
+  await store.markEntryDirty({
+    mutationId: `mutation-${entryId}`,
+    entryId,
+    op: "upsert",
+    baseRevision: 0,
+    blobId: `blob-${entryId}`,
+    hash,
+    encryptedMetadata: await encryptPendingMetadata({
+      entryId,
+      baseRevision: 0,
+      op: "upsert",
+      blobId: `blob-${entryId}`,
+      path,
+      hash,
+    }),
+    createdAt: 2,
+  });
+}
+
+// While this device held another vault's key, its pulls quarantined entries it could
+// not decrypt and the cursor moved past them. Once the key is corrected those entries
+// must be fetched again (their current server state, below the cursor) and applied
+// through the normal pull path, without moving the cursor or deleting anything local.
+describe("recoverUnreadableEntries", () => {
+  async function arrange() {
+    const store = await createInitializedTestSyncStore(createTestPlugin());
+    await store.setCursor(40);
+    const adapter = createVaultAdapter({
+      "Notes/same.md": "same body",
+      "Notes/diverged.md": "my local body",
+    });
+    // Seen by the local scan while the remote entries were quarantined: queued as new.
+    await queueLocalNewFile(store, "local-same", "Notes/same.md", "same body");
+    await queueLocalNewFile(store, "local-diverged", "Notes/diverged.md", "my local body");
+    const blobs: Record<string, Uint8Array> = {};
+    for (const [entryId, body] of [
+      ["rec-new", "server new"],
+      ["rec-same", "same body"],
+      ["rec-diverged", "server body"],
+      ["unrelated", "not requested"],
+    ] as const) {
+      blobs[`blob-${entryId}`] = await encryptTestBlob(
+        `blob-${entryId}`,
+        new TextEncoder().encode(body),
+      );
+    }
+    const conflicts: string[] = [];
+    const pull = new SyncPullService({
+      getApiBaseUrl: () => "http://127.0.0.1:8787",
+      getSyncToken: async () => createToken(),
+      getSyncStore: () => store,
+      crypto,
+      vaultAdapter: adapter,
+      eventGate: createEventGate([]),
+      pullClient: createPullClient({ blobs }),
+      onProgress: ignoreProgress,
+      onConflict: (event) => conflicts.push(event.originalPath),
+    });
+    const session = sessionWithCommits([
+      [
+        await readableCommit({ cursor: 3, entryId: "rec-new", path: "Notes/new.md", body: "server new" }),
+        await commitWith(WRONG_KEY, { cursor: 5, entryId: "still-bad", path: "Notes/bad.md" }),
+        await readableCommit({
+          cursor: 7,
+          entryId: "unrelated",
+          path: "Notes/unrelated.md",
+          body: "not requested",
+        }),
+      ],
+      [
+        await readableCommit({ cursor: 9, entryId: "rec-same", path: "Notes/same.md", body: "same body" }),
+        await readableCommit({
+          cursor: 11,
+          entryId: "rec-diverged",
+          path: "Notes/diverged.md",
+          body: "server body",
+        }),
+      ],
+    ]);
+    return { store, adapter, pull, session, conflicts };
+  }
+
+  it("applies the entries that now decrypt through the pull path, in batches, without moving the cursor", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const { store, adapter, pull, session, conflicts } = await arrange();
+    const batches: string[][] = [];
+
+    const result = await recoverUnreadableEntries({
+      session,
+      crypto,
+      entryIds: ["rec-new", "still-bad", "rec-same", "rec-diverged", "gone"],
+      applyRemoteEntryStates: async (states: RemoteEntryState[]) => {
+        batches.push(states.map((state) => state.entryId));
+        await pull.applyRemoteEntryStates(states);
+      },
+      batchSize: 2,
+    });
+
+    expect([...result.applied].sort()).toEqual(["rec-diverged", "rec-new", "rec-same"]);
+    expect(result.stillUnreadable).toEqual(["still-bad"]);
+    expect(result.notFound).toEqual(["gone"]);
+    expect(result.failed).toEqual([]);
+    expect(batches.map((batch) => batch.length)).toEqual([2, 1]);
+    expect(batches.flat()).not.toContain("unrelated");
+
+    // Recovered: written, adopted (identical local file), or a conflict keeping both.
+    expect(adapter.text("Notes/new.md")).toBe("server new");
+    expect(adapter.text("Notes/same.md")).toBe("same body");
+    const bodies = [...adapter.files.keys()].map((path) => adapter.text(path));
+    expect(bodies).toContain("my local body");
+    expect(bodies).toContain("server body");
+    expect(conflicts).toEqual(["Notes/diverged.md"]);
+    // Still unreadable: never written, never a reason to delete anything.
+    expect(adapter.text("Notes/bad.md")).toBeNull();
+    expect(adapter.text("Notes/unrelated.md")).toBeNull();
+    expect(adapter.files.size).toBe(4);
+    expect(await store.getCursor()).toBe(40);
+    await store.close();
+  });
+
+  it("keeps a batch whose apply failed as a candidate and still applies the others", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const { store, adapter, pull, session } = await arrange();
+
+    const result = await recoverUnreadableEntries({
+      session,
+      crypto,
+      entryIds: ["rec-new", "rec-same"],
+      applyRemoteEntryStates: async (states: RemoteEntryState[]) => {
+        if (states.some((state) => state.entryId === "rec-new")) {
+          throw new Error("network down");
+        }
+        await pull.applyRemoteEntryStates(states);
+      },
+      batchSize: 1,
+    });
+
+    expect(result.failed).toEqual(["rec-new"]);
+    expect(result.applied).toEqual(["rec-same"]);
+    expect(adapter.text("Notes/new.md")).toBeNull();
     await store.close();
   });
 });

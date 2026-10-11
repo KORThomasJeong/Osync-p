@@ -1,4 +1,6 @@
+import type { SyncedEntryMetadata } from "../core/content";
 import type { SyncCryptoService } from "../core/crypto-service";
+import type { ListEntryStatesResponse, RemoteEntryState } from "../remote/changes";
 import type { CommitMutationPayload, SyncRealtimeSession } from "../remote/realtime-client";
 import type { SyncEntryStore } from "../store/ports";
 import { metadataContextFromRemoteState } from "./pull-entry-state-internal";
@@ -39,42 +41,98 @@ export interface UnreadableScanResult {
 }
 
 const SCAN_PAGE_SIZE = 250;
+const LOOKUP_PAGE_SIZE = 500;
 const REMOVAL_BATCH_SIZE = 100;
+const RECOVERY_BATCH_SIZE = 100;
+
+type EntryStateSession = Pick<SyncRealtimeSession, "listEntryStates">;
+
+// Pages through every entry state on the server from cursor 0 — including the ones
+// this device's cursor already moved past. Shared by the key scan, the recovery of
+// quarantined entries and the stale-entry resolver. `visit` returns true to stop.
+export async function forEachServerEntryStatePage(
+  session: EntryStateSession,
+  pageSize: number,
+  visit: (page: ListEntryStatesResponse) => Promise<boolean | void> | boolean | void,
+): Promise<void> {
+  let after: { updatedSeq: number; entryId: string } | null = null;
+  let targetCursor: number | null = null;
+  let hasMore = true;
+  while (hasMore) {
+    const page = await session.listEntryStates({
+      sinceCursor: 0,
+      targetCursor,
+      after,
+      limit: pageSize,
+    });
+    targetCursor = page.targetCursor;
+    if ((await visit(page)) === true) {
+      return;
+    }
+    hasMore = page.hasMore;
+    after = page.nextAfter;
+  }
+}
+
+// The current server state of each requested entry (absent when not on the server).
+// Stops paging as soon as every requested entry was found.
+export async function findServerEntryStates(
+  session: EntryStateSession,
+  entryIds: ReadonlySet<string>,
+  pageSize = LOOKUP_PAGE_SIZE,
+): Promise<Map<string, RemoteEntryState>> {
+  const found = new Map<string, RemoteEntryState>();
+  if (entryIds.size === 0) {
+    return found;
+  }
+  await forEachServerEntryStatePage(session, pageSize, (page) => {
+    for (const state of page.entries) {
+      if (entryIds.has(state.entryId)) {
+        found.set(state.entryId, state);
+      }
+    }
+    return found.size >= entryIds.size;
+  });
+  return found;
+}
+
+export async function tryDecryptRemoteMetadata(
+  crypto: SyncCryptoService,
+  state: RemoteEntryState,
+): Promise<SyncedEntryMetadata | null> {
+  try {
+    return await crypto.decryptMetadata(
+      state.encryptedMetadata,
+      metadataContextFromRemoteState(state),
+    );
+  } catch {
+    return null;
+  }
+}
 
 // Read-only: pages through every entry state on the server (from cursor 0) and tries
 // to decrypt its metadata. No blobs are downloaded and nothing is written.
+// `onReadable` receives every state (deleted ones included) whose metadata decrypted.
 export async function scanUnreadableRemoteEntries(input: {
-  session: Pick<SyncRealtimeSession, "listEntryStates">;
+  session: EntryStateSession;
   crypto: SyncCryptoService;
   onProgress?: (scanned: number, total: number) => void;
+  onReadable?: (state: RemoteEntryState) => void;
   pageSize?: number;
 }): Promise<UnreadableScanResult> {
   const unreadable: UnreadableRemoteEntry[] = [];
   let scanned = 0;
-  let after: { updatedSeq: number; entryId: string } | null = null;
-  let targetCursor: number | null = null;
-  let hasMore = true;
 
-  while (hasMore) {
-    const page = await input.session.listEntryStates({
-      sinceCursor: 0,
-      targetCursor,
-      after,
-      limit: input.pageSize ?? SCAN_PAGE_SIZE,
-    });
-    targetCursor = page.targetCursor;
+  await forEachServerEntryStatePage(input.session, input.pageSize ?? SCAN_PAGE_SIZE, async (page) => {
     for (const state of page.entries) {
       scanned += 1;
       // A deleted entry needs no removal, whatever key wrote it.
-      if (state.deleted) {
+      if (state.deleted && !input.onReadable) {
         continue;
       }
-      try {
-        await input.crypto.decryptMetadata(
-          state.encryptedMetadata,
-          metadataContextFromRemoteState(state),
-        );
-      } catch {
+      if (await tryDecryptRemoteMetadata(input.crypto, state)) {
+        input.onReadable?.(state);
+      } else if (!state.deleted) {
         unreadable.push({
           entryId: state.entryId,
           revision: state.revision,
@@ -83,11 +141,93 @@ export async function scanUnreadableRemoteEntries(input: {
       }
     }
     input.onProgress?.(scanned, Math.max(scanned, page.totalEntries));
-    hasMore = page.hasMore;
-    after = page.nextAfter;
-  }
+  });
 
   return { scannedEntries: scanned, unreadable };
+}
+
+export interface UnreadableRecoveryResult {
+  // Decrypted now and handed to the pull applier. An entry whose content still
+  // fails to decrypt there is quarantined again by the applier.
+  applied: string[];
+  // Still not decryptable with this key: left alone (never written, never deleted).
+  stillUnreadable: string[];
+  // No longer on the server: nothing left to fetch.
+  notFound: string[];
+  // Applying their batch failed (e.g. a download error): candidates for the next try.
+  failed: string[];
+}
+
+// Applies remote states in bounded batches; a failing batch is reported, not thrown,
+// so one bad entry never stops the others.
+export async function applyRecoveredEntryStates(
+  states: readonly RemoteEntryState[],
+  applyRemoteEntryStates: (states: RemoteEntryState[]) => Promise<void>,
+  batchSize = RECOVERY_BATCH_SIZE,
+): Promise<{ applied: string[]; failed: string[] }> {
+  const size = Math.max(1, batchSize);
+  const result: { applied: string[]; failed: string[] } = { applied: [], failed: [] };
+  for (let offset = 0; offset < states.length; offset += size) {
+    const batch = states.slice(offset, offset + size);
+    const ids = batch.map((state) => state.entryId);
+    try {
+      await applyRemoteEntryStates(batch);
+      result.applied.push(...ids);
+    } catch (error) {
+      console.error(
+        `[osync] unreadable recovery: applying ${ids.length} recovered entr${ids.length === 1 ? "y" : "ies"} failed`,
+        error,
+      );
+      result.failed.push(...ids);
+    }
+  }
+  return result;
+}
+
+// Re-fetches the current server state of entries a pull quarantined (their metadata or
+// content did not decrypt with the key this device held then) and applies the ones
+// that decrypt now through the normal pull path — conflicts, adoption of identical
+// local files and rebasing of queued changes included — without moving the cursor.
+export async function recoverUnreadableEntries(input: {
+  session: EntryStateSession;
+  crypto: SyncCryptoService;
+  entryIds: readonly string[];
+  applyRemoteEntryStates: (states: RemoteEntryState[]) => Promise<void>;
+  batchSize?: number;
+  pageSize?: number;
+}): Promise<UnreadableRecoveryResult> {
+  const result: UnreadableRecoveryResult = {
+    applied: [],
+    stillUnreadable: [],
+    notFound: [],
+    failed: [],
+  };
+  const ids = [...new Set(input.entryIds)];
+  if (ids.length === 0) {
+    return result;
+  }
+
+  const states = await findServerEntryStates(input.session, new Set(ids), input.pageSize);
+  const readable: RemoteEntryState[] = [];
+  for (const entryId of ids) {
+    const state = states.get(entryId);
+    if (!state) {
+      result.notFound.push(entryId);
+    } else if (await tryDecryptRemoteMetadata(input.crypto, state)) {
+      readable.push(state);
+    } else {
+      result.stillUnreadable.push(entryId);
+    }
+  }
+
+  const applied = await applyRecoveredEntryStates(
+    readable,
+    input.applyRemoteEntryStates,
+    input.batchSize,
+  );
+  result.applied = applied.applied;
+  result.failed = applied.failed;
+  return result;
 }
 
 export interface UnreadableRemovalResult {

@@ -1,4 +1,3 @@
-import type { SyncedEntryMetadata } from "../core/content";
 import type { SyncCryptoService } from "../core/crypto-service";
 import type { RemoteEntryState } from "../remote/changes";
 import type { SyncRealtimeSession } from "../remote/realtime-client";
@@ -8,8 +7,11 @@ import type {
   SyncRemoteEntryStore,
 } from "../store/ports";
 import type { PendingMutationRow } from "../store/store";
-import { metadataContextFromRemoteState } from "./pull-entry-state-internal";
-import { isUnreadablePlaceholderPath } from "./unreadable-entries";
+import {
+  findServerEntryStates,
+  isUnreadablePlaceholderPath,
+  tryDecryptRemoteMetadata,
+} from "./unreadable-entries";
 
 // A commit rejected with stale_revision is normally fixed by the follow-up pull: it
 // brings the entry's newer state and rebases the queued change onto it. That pull
@@ -17,8 +19,6 @@ import { isUnreadablePlaceholderPath } from "./unreadable-entries";
 // past without applying (quarantined while this device held another vault's key) never
 // arrives, and the same commit is rejected forever. This resolver reads the entry's
 // current state from the server directly and resolves the queued change against it.
-
-const LOOKUP_PAGE_SIZE = 500;
 
 export interface StaleEntryTarget {
   mutation: PendingMutationRow;
@@ -70,9 +70,11 @@ export class StaleEntryResolver {
       return resolution;
     }
 
-    const states = await this.findEntryStates(
+    // The state we need is at or below our cursor: look it up from cursor 0.
+    const states = await findServerEntryStates(
       session,
       new Set(targets.map((target) => target.mutation.entryId)),
+      this.deps.pageSize,
     );
     const toApply: RemoteEntryState[] = [];
     for (const target of targets) {
@@ -84,7 +86,7 @@ export class StaleEntryResolver {
         continue;
       }
 
-      const metadata = await this.tryDecryptRemote(state);
+      const metadata = await tryDecryptRemoteMetadata(this.deps.crypto, state);
       const gone =
         state.deleted || !metadata || isUnreadablePlaceholderPath(metadata.path);
       if (!gone) {
@@ -136,45 +138,5 @@ export class StaleEntryResolver {
       `[osync] stale resolver: applied=${resolution.applied.length} detached=${resolution.detached.length} cleared=${resolution.cleared.length} unresolved=${resolution.unresolved.length}`,
     );
     return resolution;
-  }
-
-  // Pages through the server's entry states (from cursor 0: the state we need is at or
-  // below our cursor) until every requested entry is found.
-  private async findEntryStates(
-    session: Pick<SyncRealtimeSession, "listEntryStates">,
-    entryIds: ReadonlySet<string>,
-  ): Promise<Map<string, RemoteEntryState>> {
-    const found = new Map<string, RemoteEntryState>();
-    let after: { updatedSeq: number; entryId: string } | null = null;
-    let targetCursor: number | null = null;
-    let hasMore = true;
-    while (hasMore && found.size < entryIds.size) {
-      const page = await session.listEntryStates({
-        sinceCursor: 0,
-        targetCursor,
-        after,
-        limit: this.deps.pageSize ?? LOOKUP_PAGE_SIZE,
-      });
-      targetCursor = page.targetCursor;
-      for (const state of page.entries) {
-        if (entryIds.has(state.entryId)) {
-          found.set(state.entryId, state);
-        }
-      }
-      hasMore = page.hasMore;
-      after = page.nextAfter;
-    }
-    return found;
-  }
-
-  private async tryDecryptRemote(state: RemoteEntryState): Promise<SyncedEntryMetadata | null> {
-    try {
-      return await this.deps.crypto.decryptMetadata(
-        state.encryptedMetadata,
-        metadataContextFromRemoteState(state),
-      );
-    } catch {
-      return null;
-    }
   }
 }
