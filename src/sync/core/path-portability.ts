@@ -22,10 +22,23 @@ export type WindowsNameIssue =
   | { reason: "trailing_dot_or_space"; component: string }
   | { reason: "reserved_name"; component: string };
 
-// <>:"|?* plus the C0 control characters U+0000–U+001F.
-// eslint-disable-next-line no-control-regex
-const WINDOWS_INVALID_CHARACTER = /[<>:"|?*\u0000-\u001f]/;
+const WINDOWS_INVALID_CHARACTER = /[<>:"|?*]/;
 const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+// <>:"|?* plus the C0 control characters U+0000–U+001F. Control characters are
+// checked by code point so the pattern stays free of control-character escapes.
+function findWindowsInvalidCharacter(component: string): string | null {
+  const invalid = WINDOWS_INVALID_CHARACTER.exec(component);
+  if (invalid) {
+    return invalid[0];
+  }
+  for (const character of component) {
+    if (character.charCodeAt(0) <= 0x1f) {
+      return character;
+    }
+  }
+  return null;
+}
 
 export function describeWindowsNameIssue(path: string): WindowsNameIssue | null {
   for (const component of path.split("/")) {
@@ -33,9 +46,9 @@ export function describeWindowsNameIssue(path: string): WindowsNameIssue | null 
       continue;
     }
 
-    const invalid = WINDOWS_INVALID_CHARACTER.exec(component);
+    const invalid = findWindowsInvalidCharacter(component);
     if (invalid) {
-      return { reason: "invalid_character", component, character: invalid[0] };
+      return { reason: "invalid_character", component, character: invalid };
     }
 
     if (component.endsWith(".") || component.endsWith(" ")) {
