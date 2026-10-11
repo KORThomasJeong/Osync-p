@@ -774,7 +774,7 @@ describe("clearDexieSyncStore robustness", () => {
       // from Dexie.delete; reset must still succeed visibly so the user isn't
       // left staring at a generic failure toast. Tables are cleared in place
       // before the delete attempt, and clearLocalVaultId always runs.
-      await expect(clearDexieSyncStore(plugin)).resolves.toBeUndefined();
+      await expect(clearDexieSyncStore(plugin)).resolves.toEqual({ verified: true });
     } finally {
       spy.mockRestore();
     }

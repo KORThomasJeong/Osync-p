@@ -1,5 +1,4 @@
 import { hashBytes } from "../core/content";
-import type { SyncedEntryMetadata } from "../core/content";
 import { mapWithConcurrency } from "../core/concurrency";
 import type { SyncCryptoService } from "../core/crypto-service";
 import {
@@ -10,6 +9,7 @@ import {
 } from "../core/mutation-queue";
 import type {
   LocalSyncEntryRow,
+  PendingMutationRow,
   RemoteSyncEntryRow,
 } from "../store/store";
 import type {
@@ -25,6 +25,11 @@ import {
 } from "./mass-delete-guard";
 import { isAutoMergeTextPath } from "./text-merge-policy";
 import { toPathKey } from "../store/dexie/path-key";
+import {
+  dropUndecryptablePendingMutation,
+  dropUndecryptablePendingMutations,
+  tryDecryptPendingMetadata,
+} from "./undecryptable-pending";
 
 export interface LocalSyncFile {
   path: string;
@@ -46,18 +51,25 @@ export interface SyncLocalReconcileServiceDeps {
   prepareConcurrency?: number;
   // Every syncable local file path of a completed scan (e.g. for portability warnings).
   onLocalFilesScanned?: (paths: readonly string[]) => void;
+  // A queued change this key cannot decrypt was dropped during the scan (see
+  // undecryptable-pending.ts); the caller re-scans with sanitizePendingMetadata.
+  onUndecryptablePendingDropped?: (mutation: PendingMutationRow) => void;
 }
 
 export interface SyncLocalReconcileStore
   extends Pick<SyncEntryStore, "deleteEntry" | "getEntryByPath" | "getOrCreateEntryId">,
     Pick<
       SyncLocalEntryStore,
-      "applyLocalState" | "getLocalStateByPath" | "listLocalStates"
+      "applyLocalState" | "clearLocalState" | "getLocalStateByPath" | "listLocalStates"
     >,
     Pick<SyncRemoteEntryStore, "getRemoteStateById">,
     Pick<
       SyncMutationStore,
-      "getDirtyEntryMutation" | "markEntryClean" | "replaceDirtyEntry"
+      | "clearDirtyEntryByMutationId"
+      | "getDirtyEntryMutation"
+      | "listDirtyEntries"
+      | "markEntryClean"
+      | "replaceDirtyEntry"
     >,
     Pick<SyncStoreLifecycle, "flush"> {}
 
@@ -81,8 +93,15 @@ export class SyncLocalReconcileService {
 
   async reconcileOnce(options?: {
     allowMassDelete?: boolean;
+    // First drop every queued change this key cannot decrypt, so this same scan
+    // queues those files again with the current key. Costs one metadata decrypt
+    // per queued change, so only requested after such a change was found.
+    sanitizePendingMetadata?: boolean;
   }): Promise<ReconcileOnceResult> {
     const store = this.requireStore();
+    if (options?.sanitizePendingMetadata) {
+      await dropUndecryptablePendingMutations(store, this.deps.crypto);
+    }
     const localFiles = await this.deps.scanner.listFiles();
     try {
       this.deps.onLocalFilesScanned?.(localFiles.map((file) => file.path));
@@ -393,23 +412,17 @@ export class SyncLocalReconcileService {
         continue;
       }
 
-      let metadata: SyncedEntryMetadata;
-      try {
-        metadata = await this.deps.crypto.decryptMetadata(
-          pending.encryptedMetadata,
-          {
-            entryId: pending.entryId,
-            revision: pending.baseRevision + 1,
-            op: pending.op,
-            blobId: pending.blobId,
-          },
-        );
-      } catch (error) {
-        console.error(
-          `[osync] reconcile: failed to decrypt delete mutation entry=${pending.entryId} rev=${pending.baseRevision + 1}`,
-          error,
-        );
-        throw error;
+      const metadata = await tryDecryptPendingMetadata(this.deps.crypto, pending);
+      if (!metadata) {
+        // Queued with another key: it can never be pushed. Drop it and let the
+        // caller re-scan, which queues the delete again with the current key.
+        await dropUndecryptablePendingMutation(store, pending);
+        try {
+          this.deps.onUndecryptablePendingDropped?.(pending);
+        } catch (error) {
+          console.error("[osync] reconcile: dropped-mutation listener failed", error);
+        }
+        continue;
       }
       const pendingEntry = entriesById.get(pending.entryId);
       if (pendingEntry) {

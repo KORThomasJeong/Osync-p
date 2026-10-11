@@ -60,4 +60,32 @@ describe("SyncAutoLoopState 가드 전이", () => {
     state.startConnecting();
     expect(() => state.resumeFromPause()).toThrow();
   });
+
+  it("beginConnecting: draining 상태는 유지하고 live 는 reconnect_wait 를 거쳐 connecting", () => {
+    const state = new SyncAutoLoopState();
+    state.startConnecting();
+    state.goLive();
+    state.beginConnecting();
+    expect(state.current).toBe("connecting");
+
+    state.drain();
+    state.beginConnecting();
+    expect(state.current).toBe("draining");
+  });
+
+  it("connectionEstablished: draining/retry_wait 는 유지, connecting/reconnect_wait 는 live", () => {
+    const state = new SyncAutoLoopState();
+    state.startConnecting();
+    state.drain();
+    expect(() => state.connectionEstablished()).not.toThrow();
+    expect(state.current).toBe("draining");
+
+    state.waitForRetry();
+    state.connectionEstablished();
+    expect(state.current).toBe("retry_wait");
+
+    state.waitForReconnect();
+    state.connectionEstablished();
+    expect(state.current).toBe("live");
+  });
 });

@@ -19,6 +19,7 @@ import { MassDeleteGuardError } from "../engine/mass-delete-guard";
 import { classifyReconnectError } from "../remote/reconnect-error";
 import { SyncConflictQueue } from "./conflict-queue";
 import {
+  type BlockedUpload,
   type InitialCollisionPreview,
   SyncEngine,
   type SyncEngineEntryVersionsPage,
@@ -60,7 +61,7 @@ export type {
   UnwritablePathEntry,
 } from "./device-sync-issues";
 
-export type { InitialCollisionPreview } from "./engine";
+export type { BlockedUpload, InitialCollisionPreview } from "./engine";
 export type { SyncActivityEntry, SyncActivityLogStorage } from "./activity-log";
 
 export type {
@@ -146,6 +147,9 @@ export class SyncController {
   // Mirrors the user's pause so a startup retry that starts the loop re-applies it.
   private autoSyncPaused = false;
   private lastReconcileAt: number | null = null;
+  // A reset/disconnect is tearing the store down: flush, check, resume and startup
+  // requests that arrive meanwhile are ignored instead of racing it.
+  private resetting = false;
 
   constructor(private readonly deps: SyncControllerDeps) {}
 
@@ -273,6 +277,28 @@ export class SyncController {
     await this.checkNow();
   }
 
+  // Local changes kept on this device but no longer pushed (too large, over quota, or
+  // rejected by the server repeatedly). Never throws.
+  async getBlockedUploads(): Promise<readonly BlockedUpload[]> {
+    try {
+      return await this.syncEngine.listBlockedUploads();
+    } catch (error) {
+      console.warn("[osync] failed to list blocked uploads", error);
+      return [];
+    }
+  }
+
+  async retryBlockedUploads(): Promise<void> {
+    try {
+      await this.syncEngine.retryBlockedUploads();
+    } catch (error) {
+      this.activityLog.record("error", `Retry failed: ${describeActivityError(error)}`);
+      this.deps.notifyError(error, "Retry failed");
+    } finally {
+      this.activityLog.flush();
+    }
+  }
+
   // Count of local changes recorded but not yet accepted by the server.
   async getPendingUploadCount(): Promise<number> {
     try {
@@ -287,6 +313,9 @@ export class SyncController {
   // edits now instead of after the debounce, since the OS may suspend us first.
   // Resolves within FLUSH_MAX_WAIT_MS even if the push is still running.
   async flushPendingNow(): Promise<void> {
+    if (this.resetting) {
+      return;
+    }
     try {
       await this.syncEngine.waitForLocalMutationWork();
       const pending = await this.syncEngine.countPendingMutations();
@@ -307,7 +336,11 @@ export class SyncController {
   // catch-up pull) but with a fresh local scan and fresh backoffs. Never throws;
   // failures show up in the sync status and the activity log.
   async checkNow(): Promise<void> {
-    if (!this.deps.hasActiveRemoteVaultSession() || !this.deps.hasAuthenticatedSession()) {
+    if (
+      this.resetting ||
+      !this.deps.hasActiveRemoteVaultSession() ||
+      !this.deps.hasAuthenticatedSession()
+    ) {
       return;
     }
 
@@ -398,23 +431,36 @@ export class SyncController {
 
   async resetLocalSyncState(opts?: { preserveLocalVaultId?: boolean }): Promise<void> {
     this.cancelStartupRetry();
-    this.syncEngine.stopAutoSync();
-    // Let any in-flight pull/push and queued local work settle before detaching and
-    // deleting the store, so nothing keeps writing to a store being torn down.
-    await this.syncEngine.drainInFlightSync();
-    this.statusTracker.setStorageStatus(null);
-    const store = this.syncEngine.detachStore();
+    this.resetting = true;
     try {
-      await store?.close();
-    } catch {
-      // Continue clearing persisted sync state even if flushing the old store fails.
+      // Stop auto sync and let the drain, connect, pushes, pulls, scans and queued
+      // local work that already started settle before detaching and deleting the
+      // store, so nothing keeps writing to a store being torn down. Anything still
+      // holding the old store afterwards fails on the detach guard.
+      await this.syncEngine.stopAutoSyncAndWait();
+      this.statusTracker.setStorageStatus(null);
+      const store = this.syncEngine.detachStore();
+      try {
+        await store?.close();
+      } catch {
+        // Continue clearing persisted sync state even if flushing the old store fails.
+      }
+      const cleared = await clearDexieSyncStore(this.deps.plugin, opts);
+      if (!cleared.verified) {
+        this.activityLog.record(
+          "warning",
+          "Reset: the old local sync database could not be cleared; starting a new one",
+        );
+      }
+      this.statusTracker.setProgress({
+        completedEntries: 0,
+        totalEntries: 0,
+      });
+      this.statusTracker.setStatus("not_ready");
+    } finally {
+      this.resetting = false;
+      this.activityLog.flush();
     }
-    await clearDexieSyncStore(this.deps.plugin, opts);
-    this.statusTracker.setProgress({
-      completedEntries: 0,
-      totalEntries: 0,
-    });
-    this.statusTracker.setStatus("not_ready");
   }
 
   getSyncStatusLabel(): string {
@@ -456,6 +502,9 @@ export class SyncController {
   }
 
   async ensureAutoSyncState(): Promise<void> {
+    if (this.resetting) {
+      return;
+    }
     // This attempt supersedes any scheduled retry; a failure below reschedules it.
     this.clearStartupRetryTimer();
     if (!this.deps.hasActiveRemoteVaultSession() || !this.deps.hasAuthenticatedSession()) {
@@ -648,7 +697,11 @@ export class SyncController {
   }
 
   async resumeAutoSync(): Promise<void> {
-    if (!this.deps.hasActiveRemoteVaultSession() || !this.deps.hasAuthenticatedSession()) {
+    if (
+      this.resetting ||
+      !this.deps.hasActiveRemoteVaultSession() ||
+      !this.deps.hasAuthenticatedSession()
+    ) {
       return;
     }
 

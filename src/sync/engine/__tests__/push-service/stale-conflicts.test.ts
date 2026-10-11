@@ -185,6 +185,7 @@ describe("SyncPushService stale revisions", () => {
       cursor: 17,
       mutationsPushed: 0,
       mutationsRequeued: 0,
+      mutationsDropped: 0,
       filesCreatedOrUpdated: 0,
       filesDeleted: 0,
       conflictsCreated: 1,
@@ -262,6 +263,7 @@ describe("SyncPushService stale revisions", () => {
       cursor: 0,
       mutationsPushed: 0,
       mutationsRequeued: 1,
+      mutationsDropped: 0,
       filesCreatedOrUpdated: 0,
       filesDeleted: 0,
       conflictsCreated: 0,
@@ -372,6 +374,7 @@ describe("SyncPushService stale revisions", () => {
     await expect(service.pushPendingMutations(session)).resolves.toMatchObject({
       mutationsPushed: 1,
       mutationsRequeued: 1,
+      mutationsDropped: 0,
       shouldPullAfterPush: true,
       hasMore: true,
     });
@@ -521,6 +524,7 @@ describe("SyncPushService stale revisions", () => {
       cursor: 10,
       mutationsPushed: 1,
       mutationsRequeued: 0,
+      mutationsDropped: 0,
       filesCreatedOrUpdated: 1,
       filesDeleted: 0,
       conflictsCreated: 0,

@@ -558,6 +558,14 @@ export class OsyncPluginController implements OsyncSettingsController, OsyncSync
     await this.syncController.retryUnwritablePaths();
   }
 
+  async getBlockedUploads(): Promise<readonly { path: string; reason: string }[]> {
+    return await this.syncController.getBlockedUploads();
+  }
+
+  async retryBlockedUploads(): Promise<void> {
+    await this.syncController.retryBlockedUploads();
+  }
+
   // Best-effort push of pending local changes when the app is backgrounded
   // (iOS may suspend it right after). Silent: no notice on failure.
   flushSyncOnHide(): void {

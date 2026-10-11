@@ -439,6 +439,47 @@ describe("OsyncSyncStatusModal", () => {
     expect(root.find("osync-status-activity-empty").text).toBe("No recent activity.");
   });
 
+  describe("blocked uploads", () => {
+    it("lists local changes the server kept rejecting, with a Retry that refreshes the list", async () => {
+      const source = createSource();
+      let blocked = [
+        { path: "notes/a.md", reason: "Rejected by the server repeatedly" },
+        { path: "big.zip", reason: "Too large for the server" },
+      ];
+      const retryBlockedUploads = vi.fn(async () => {
+        blocked = [{ path: "big.zip", reason: "Too large for the server" }];
+      });
+      source.getBlockedUploads = async () => blocked;
+      source.retryBlockedUploads = retryBlockedUploads;
+      const { root } = openModal(source);
+      await flush();
+
+      expect(root.find("osync-status-blocked-summary").text).toBe(
+        "Not uploaded from this device (2)",
+      );
+      const list = root.find("osync-status-blocked");
+      expect(list.textOf(list)).toContain("notes/a.md");
+      expect(list.textOf(list)).toContain("Rejected by the server repeatedly");
+
+      root.find("osync-status-blocked-retry").click();
+      await flush();
+
+      expect(retryBlockedUploads).toHaveBeenCalledTimes(1);
+      expect(root.find("osync-status-blocked-summary").text).toBe(
+        "Not uploaded from this device (1)",
+      );
+    });
+
+    it("shows no section when nothing is blocked", async () => {
+      const source = createSource();
+      source.getBlockedUploads = async () => [];
+      const { root } = openModal(source);
+      await flush();
+
+      expect(() => root.find("osync-status-blocked")).toThrow();
+    });
+  });
+
   describe("vault key", () => {
     it("lists entries that can't be decrypted and opens the key check from there", async () => {
       const source = createSource();

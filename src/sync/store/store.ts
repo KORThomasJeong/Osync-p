@@ -68,7 +68,9 @@ export type SyncBlobRole = "base" | "remote" | "local-cache";
 export type PendingMutationBlockedReason =
   | "file_too_large"
   | "storage_quota_exceeded"
-  | "unresolved_rejection";
+  | "unresolved_rejection"
+  // The server rejected the change several times in a row (see push-service.ts).
+  | "repeated_rejection";
 
 export interface PendingMutationRow {
   mutationId: string;

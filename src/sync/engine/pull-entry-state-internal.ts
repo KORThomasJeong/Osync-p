@@ -62,6 +62,8 @@ export type PreparedPendingMerge =
     }
   | {
       kind: "rebase-client";
+      // The pending metadata re-encrypted for the revision it now commits as.
+      encryptedMetadata: string;
     };
 
 export type PreparedPendingConflict = {

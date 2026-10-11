@@ -6,7 +6,11 @@ import {
   type SyncStorageStatus,
 } from "../remote/realtime-client";
 import type { SyncCursorStore } from "../store/ports";
-import { SyncAutoLoopState, type SyncConnectionState } from "./auto-sync-state";
+import {
+  InvalidSyncTransitionError,
+  SyncAutoLoopState,
+  type SyncConnectionState,
+} from "./auto-sync-state";
 import { AutoSyncTimers } from "./auto-sync-timers";
 import { PendingSyncWorkQueue } from "./auto-sync-work-queue";
 
@@ -91,6 +95,24 @@ export class SyncAutoLoop {
     this.realtimeSession = null;
     this.lastVerifiedAt = null;
     this.lastLoggedVerification = null;
+  }
+
+  // Stops the loop and resolves once the drain and connect that were already running
+  // have settled. Callers about to tear down the store (reset, disconnect) await this
+  // so no step of an old drain is still touching it afterwards.
+  async stopAndWait(): Promise<void> {
+    this.stop();
+    for (;;) {
+      const inFlight = [this.drainPromise, this.connectPromise].filter(
+        (promise): promise is Promise<void> => promise !== null,
+      );
+      if (inFlight.length === 0) {
+        return;
+      }
+      await Promise.allSettled(inFlight);
+      // Let the settled drain's finally clear its promise before checking again.
+      await Promise.resolve();
+    }
   }
 
   pause(): void {
@@ -280,14 +302,11 @@ export class SyncAutoLoop {
 
   private async openRealtimeSession(): Promise<void> {
     try {
-      if (this.state.current === "live") {
-        // Reconnecting after an unexpected session loss (e.g. the store DB was
-        // deleted during a reset, closing the socket while the loop stayed
-        // "live"). Move through reconnect_wait so startConnecting is a valid
-        // transition instead of throwing "Invalid transition: live → connecting".
-        this.state.waitForReconnect();
-      }
-      this.state.startConnecting();
+      // Reconnecting after an unexpected session loss keeps the loop's state valid:
+      // a live loop passes through reconnect_wait, and a drain that is already
+      // running (e.g. a flush that started while a resume reconnects) stays
+      // "draining" and simply waits for this connect.
+      this.state.beginConnecting();
       const store = this.deps.getSyncStore();
       if (!store) {
         throw new Error("Sync store is not initialized.");
@@ -337,13 +356,21 @@ export class SyncAutoLoop {
       } else {
         this.recordVerification(session.serverCursor, "hello");
       }
-      this.state.goLive();
+      this.state.connectionEstablished();
+      if (this.drainPromise) {
+        // The running drain was waiting for this socket; it reports idle when done.
+        return;
+      }
       if (this.hasPendingWork()) {
         void this.drain();
       } else {
         this.deps.onIdle?.();
       }
     } catch (error) {
+      if (!this.isActive()) {
+        // Stopped (reset, disconnect, unload) while connecting: not a sync error.
+        return;
+      }
       this.handleError(error);
       this.scheduleReconnect();
     }
@@ -437,18 +464,26 @@ export class SyncAutoLoop {
 
       let shouldPullNow = shouldPull;
       let pushCompleted = !shouldPush;
+      // Work taken from the queue that has not run yet goes back on it (a pause keeps
+      // it for resume). A stopped loop drops it: its queue was cleared on stop.
+      const requeueUnfinished = (): void => {
+        if (this.state.current === "stopped") {
+          return;
+        }
+        if (shouldPush && !pushCompleted) {
+          this.requestPush();
+        }
+        if (shouldPullNow) {
+          this.requestPullWork(work.pullTargetCursor);
+        }
+      };
       try {
         let session: SyncRealtimeSession | null = null;
         if (shouldPush || shouldPullNow) {
           await this.ensureRealtimeSession();
           session = this.realtimeSession;
           if (!session) {
-            if (shouldPush) {
-              this.requestPush();
-            }
-            if (shouldPullNow) {
-              this.requestPullWork(work.pullTargetCursor);
-            }
+            requeueUnfinished();
             if (!this.timers.has("reconnect")) {
               this.scheduleSyncRetry();
             }
@@ -460,6 +495,10 @@ export class SyncAutoLoop {
           if (!session) {
             throw new Error("Sync realtime session is not connected.");
           }
+          if (!this.isActive()) {
+            requeueUnfinished();
+            return;
+          }
           this.recordVerification(
             cursorOfPullResult(await this.deps.pullOnce(session)),
             "pull",
@@ -470,6 +509,10 @@ export class SyncAutoLoop {
           if (!session) {
             throw new Error("Sync realtime session is not connected.");
           }
+          if (!this.isActive()) {
+            requeueUnfinished();
+            return;
+          }
           const pushResult = await this.deps.pushPendingMutations(session);
           pushCompleted = true;
           shouldPullNow = shouldPullNow || pushResult.shouldPullAfterPush;
@@ -478,6 +521,11 @@ export class SyncAutoLoop {
           }
         }
         if (shouldPullNow) {
+          if (!this.isActive()) {
+            // Stopped or paused mid-drain (reset, disconnect): start no further step.
+            requeueUnfinished();
+            return;
+          }
           if (!session) {
             throw new Error("Sync realtime session is not connected.");
           }
@@ -488,11 +536,11 @@ export class SyncAutoLoop {
         }
         this.resetSyncRetry();
       } catch (error) {
-        if (shouldPush && !pushCompleted) {
-          this.requestPush();
-        }
-        if (shouldPullNow) {
-          this.requestPullWork(work.pullTargetCursor);
+        requeueUnfinished();
+        if (!this.isActive()) {
+          // Stopped or paused while this step ran (a reset may have detached the
+          // store under it): the failure is an artifact of stopping, not a sync error.
+          return;
         }
         this.handleError(error);
         this.scheduleSyncRetry();
@@ -503,6 +551,14 @@ export class SyncAutoLoop {
 
   private scheduleSyncRetry(): void {
     if (!this.isActive() || this.timers.has("syncRetry")) {
+      return;
+    }
+    if (this.timers.has("reconnect") || this.state.current === "reconnect_wait") {
+      // The socket is gone and a reconnect is pending: the new session drains the
+      // queued work, so a sync retry would only race it.
+      if (!this.timers.has("reconnect") && !this.connectPromise) {
+        this.scheduleReconnect();
+      }
       return;
     }
 
@@ -548,6 +604,12 @@ export class SyncAutoLoop {
   }
 
   private handleError(error: unknown): void {
+    if (error instanceof InvalidSyncTransitionError) {
+      // The loop's own bookkeeping, not a sync failure: never surface it as one.
+      // Pending work stays queued and the next trigger (timer, edit, resume) runs it.
+      console.error("[osync] auto sync state", error);
+      return;
+    }
     this.deps.onError?.(error);
   }
 

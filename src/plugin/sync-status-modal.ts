@@ -35,6 +35,10 @@ export interface OsyncSyncStatusSource {
   getUnreadableEntryCount?(): number;
   // Opens the "Verify vault key" modal.
   openVerifyVaultKey?(): void;
+  // Local changes this device stopped uploading (too large, over quota, or rejected
+  // by the server repeatedly), and a retry for the rejected ones.
+  getBlockedUploads?(): Promise<readonly { path: string; reason: string }[]>;
+  retryBlockedUploads?(): Promise<void>;
   // Optional: keeps storage usage fresh while the modal is open.
   watchStorageStatus?(): void;
   unwatchStorageStatus?(): void;
@@ -79,6 +83,10 @@ export class OsyncSyncStatusModal extends Modal {
   private deviceIssuesEl: HTMLElement | null = null;
   private retryButtonEl: HTMLButtonElement | null = null;
   private retryRunning = false;
+  private blockedUploads: readonly { path: string; reason: string }[] = [];
+  private blockedRequestInFlight = false;
+  private blockedRequestQueued = false;
+  private blockedRetryRunning = false;
 
   constructor(
     app: App,
@@ -149,6 +157,7 @@ export class OsyncSyncStatusModal extends Modal {
       this.source.onStatusChange(() => {
         this.renderStatus();
         this.requestPendingUploadCount();
+        this.requestBlockedUploads();
       }),
     );
     this.cleanups.push(
@@ -179,6 +188,7 @@ export class OsyncSyncStatusModal extends Modal {
     this.renderDeviceIssues();
     this.renderActivity();
     this.requestPendingUploadCount();
+    this.requestBlockedUploads();
   }
 
   onClose(): void {
@@ -271,6 +281,35 @@ export class OsyncSyncStatusModal extends Modal {
       }
     }
 
+    if (this.blockedUploads.length > 0) {
+      const details = container.createEl("details", { cls: "osync-status-blocked" });
+      details.createEl("summary", {
+        cls: "osync-status-blocked-summary",
+        text: `Not uploaded from this device (${this.blockedUploads.length})`,
+      });
+      details.createDiv({
+        cls: "osync-status-blocked-hint",
+        text: "These local changes are kept on this device but were not uploaded. Retry sends the rejected ones again.",
+      });
+      if (this.source.retryBlockedUploads) {
+        const actions = details.createDiv({ cls: "osync-status-issue-actions" });
+        const retry = actions.createEl("button", {
+          cls: "osync-status-blocked-retry",
+          text: "Retry",
+        });
+        retry.disabled = this.blockedRetryRunning;
+        retry.addEventListener("click", () => {
+          void this.runBlockedRetry();
+        });
+      }
+      const list = details.createDiv({ cls: "osync-status-issue-list" });
+      for (const entry of this.blockedUploads) {
+        const row = list.createDiv({ cls: "osync-status-issue-row" });
+        row.createSpan({ cls: "osync-status-issue-path", text: entry.path });
+        row.createSpan({ cls: "osync-status-issue-reason", text: entry.reason });
+      }
+    }
+
     const unreadable = this.source.getUnreadableEntryCount?.() ?? 0;
     if (unreadable > 0) {
       const details = container.createEl("details", { cls: "osync-status-unreadable" });
@@ -328,6 +367,48 @@ export class OsyncSyncStatusModal extends Modal {
       this.retryRunning = false;
       if (this.retryButtonEl) this.retryButtonEl.disabled = false;
     }
+  }
+
+  private async runBlockedRetry(): Promise<void> {
+    if (this.blockedRetryRunning || !this.source.retryBlockedUploads) return;
+    this.blockedRetryRunning = true;
+    this.renderDeviceIssues();
+    try {
+      await this.source.retryBlockedUploads();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      new Notice(`Osync: Retry failed: ${message}`);
+    } finally {
+      this.blockedRetryRunning = false;
+      this.requestBlockedUploads();
+    }
+  }
+
+  // Coalesces bursts of status changes into at most one in-flight blocked-list query.
+  private requestBlockedUploads(): void {
+    const load = this.source.getBlockedUploads;
+    if (!this.isOpen || !load) return;
+    if (this.blockedRequestInFlight) {
+      this.blockedRequestQueued = true;
+      return;
+    }
+    this.blockedRequestInFlight = true;
+    void load
+      .call(this.source)
+      .then((blocked) => {
+        this.blockedUploads = blocked;
+      })
+      .catch((error: unknown) => {
+        console.warn("[osync:status-modal] blocked upload list failed", error);
+      })
+      .finally(() => {
+        this.blockedRequestInFlight = false;
+        this.renderDeviceIssues();
+        if (this.blockedRequestQueued) {
+          this.blockedRequestQueued = false;
+          this.requestBlockedUploads();
+        }
+      });
   }
 
   private renderActivity(): void {

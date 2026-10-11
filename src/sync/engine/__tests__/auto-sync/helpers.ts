@@ -28,6 +28,7 @@ export function createPushResult(
     cursor: 1,
     mutationsPushed: 1,
     mutationsRequeued: 0,
+    mutationsDropped: 0,
     filesCreatedOrUpdated: 1,
     filesDeleted: 0,
     conflictsCreated: 0,

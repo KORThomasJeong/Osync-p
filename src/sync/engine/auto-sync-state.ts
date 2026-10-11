@@ -9,6 +9,14 @@ export type SyncLoopState =
 
 export type SyncConnectionState = "connecting" | "live" | "reconnecting";
 
+// A loop-state bug, not a sync failure: the loop logs it instead of reporting it.
+export class InvalidSyncTransitionError extends Error {
+  constructor(from: SyncLoopState, to: SyncLoopState) {
+    super(`Invalid transition: ${from} → ${to}`);
+    this.name = "InvalidSyncTransitionError";
+  }
+}
+
 export class SyncAutoLoopState {
   private state: SyncLoopState = "stopped";
 
@@ -55,16 +63,42 @@ export class SyncAutoLoopState {
       this.state !== "reconnect_wait" &&
       this.state !== "connecting"
     ) {
-      throw new Error(`Invalid transition: ${this.state} → connecting`);
+      throw new InvalidSyncTransitionError(this.state, "connecting");
     }
     this.set("connecting");
   }
 
   goLive(): void {
     if (this.state !== "connecting" && this.state !== "reconnect_wait") {
-      throw new Error(`Invalid transition: ${this.state} → live`);
+      throw new InvalidSyncTransitionError(this.state, "live");
     }
     this.set("live");
+  }
+
+  // A (re)connect is starting. A drain that is already running owns the state and
+  // connects inline, so it stays "draining"; a live loop that lost its socket passes
+  // through reconnect_wait so the move to "connecting" is a valid transition.
+  beginConnecting(): void {
+    if (this.state === "draining") {
+      return;
+    }
+    if (this.state === "live") {
+      this.waitForReconnect();
+    }
+    this.startConnecting();
+  }
+
+  // The socket is up. Only a loop that was waiting for it goes live; a drain or a
+  // sync retry that is already scheduled keeps its state and decides what comes next.
+  connectionEstablished(): void {
+    if (
+      this.state === "draining" ||
+      this.state === "retry_wait" ||
+      this.state === "live"
+    ) {
+      return;
+    }
+    this.goLive();
   }
 
   drain(): void {
@@ -75,7 +109,7 @@ export class SyncAutoLoopState {
       this.state !== "draining" &&
       this.state !== "retry_wait"
     ) {
-      throw new Error(`Invalid transition: ${this.state} → draining`);
+      throw new InvalidSyncTransitionError(this.state, "draining");
     }
     this.set("draining");
   }
@@ -86,7 +120,7 @@ export class SyncAutoLoopState {
 
   resumeFromPause(): void {
     if (this.state !== "paused") {
-      throw new Error(`Invalid transition: ${this.state} → live`);
+      throw new InvalidSyncTransitionError(this.state, "live");
     }
     this.set("live");
   }
@@ -102,7 +136,7 @@ export class SyncAutoLoopState {
       this.state !== "draining" &&
       this.state !== "retry_wait"
     ) {
-      throw new Error(`Invalid transition: ${this.state} → retry_wait`);
+      throw new InvalidSyncTransitionError(this.state, "retry_wait");
     }
     this.set("retry_wait");
   }

@@ -318,6 +318,12 @@ class InMemorySyncStore implements SyncStore {
     this.localEntries.delete(entryId);
     this.remoteEntries.delete(entryId);
     this.entries.delete(entryId);
+    // Like the Dexie store, where the queued mutation lives on the entry's row.
+    for (const pending of [...this.pendingMutations.values()]) {
+      if (pending.entryId === entryId) {
+        this.pendingMutations.delete(pending.mutationId);
+      }
+    }
   }
 
   async getCursor(): Promise<number> {
@@ -370,6 +376,13 @@ class InMemorySyncStore implements SyncStore {
       .filter((mutation) => mutation.status === "pending")
       .sort(comparePendingMutationsAscending)
       .slice(0, limit)
+      .map(toPendingMutationRow);
+  }
+
+  async listBlockedDirtyEntries(): Promise<PendingMutationRow[]> {
+    return [...this.pendingMutations.values()]
+      .filter((mutation) => mutation.status === "blocked")
+      .sort(comparePendingMutationsAscending)
       .map(toPendingMutationRow);
   }
 

@@ -118,6 +118,15 @@ describe("Pull conflict tiebreak (non-mergeable conflicts)", () => {
     expect(pending?.baseRevision).toBe(5);
     expect(pending?.hash).toBe(localHash);
     expect(pending?.blobId).toBe("blob-local");
+    // Its metadata is bound to the revision it now commits as (AAD), so the next
+    // push can still decrypt it. A rebase that kept the old ciphertext left a row
+    // that failed with OperationError on every push.
+    await expect(
+      new VaultKeyCryptoService(() => TEST_VAULT_KEY).decryptMetadata(
+        pending!.encryptedMetadata,
+        { entryId: "entry-pic", revision: 6, op: "upsert", blobId: "blob-local" },
+      ),
+    ).resolves.toMatchObject({ path: "Attachments/picture.png", hash: localHash });
 
     // Remote state row updated; local state row untouched.
     expect(await store.getRemoteStateById("entry-pic")).toMatchObject({

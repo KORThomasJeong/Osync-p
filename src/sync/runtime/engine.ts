@@ -13,7 +13,8 @@ import {
 import { ObsidianSyncVaultAdapter } from "../vault/obsidian-vault-adapter";
 import { SyncErrorEscalator } from "./sync-error-escalator";
 import { SyncPullService } from "../engine/pull-service";
-import { SyncPushService } from "../engine/push-service";
+import { type BlockedMutationEvent, SyncPushService } from "../engine/push-service";
+import { StaleEntryResolver } from "../engine/stale-entry-resolver";
 import { SyncHttpClient } from "../remote/http-client";
 import { SyncBlobClient } from "../remote/blob-client";
 import { SyncPullClient } from "../remote/pull-client";
@@ -25,8 +26,18 @@ import {
   type SyncRealtimeSession,
   type SyncStorageStatus,
 } from "../remote/realtime-client";
-import type { DeletedSyncEntryRow, SyncStore } from "../store/store";
+import type {
+  DeletedSyncEntryRow,
+  PendingMutationBlockedReason,
+  SyncStore,
+} from "../store/store";
+import { tryDecryptPendingMetadata } from "../engine/undecryptable-pending";
 import type { SyncStoreCorruptionListener } from "../store/ports";
+import {
+  createDetachableSyncStore,
+  type DetachableSyncStore,
+  isSyncStoreDetachedError,
+} from "../store/detachable-store";
 import { cleanupOrphanSyncStores } from "../store/dexie/database";
 import { readOwnedLocalVaultIds } from "../store/dexie/local-vault";
 import { findExcludedRemoteEntries } from "../engine/purge-excluded";
@@ -111,7 +122,9 @@ export interface SyncEngineDeps {
 const MAX_INDIVIDUAL_PORTABILITY_NOTICES = 3;
 
 export class SyncEngine {
+  // Services only ever see the detachable handle (see detachable-store.ts).
   private syncStore: SyncStore | null = null;
+  private storeHandle: DetachableSyncStore | null = null;
   private corruptionListener: SyncStoreCorruptionListener | null = null;
   private actionableAttention = false;
   private readonly syncErrorEscalator = new SyncErrorEscalator();
@@ -128,6 +141,10 @@ export class SyncEngine {
   private newDeviceIssuesThisPull = 0;
   // Undecryptable entries first seen during the pull in progress (one log line per pull).
   private newUnreadableThisPull = 0;
+  // Queued local changes dropped because this key cannot decrypt them, and entries
+  // forgotten so their files upload as new entries, not yet followed by the re-scan
+  // that queues those files again.
+  private readonly pendingRescan = { dropped: 0, detached: 0, queued: false };
   private readonly vaultAdapter = new ObsidianSyncVaultAdapter(
     this.deps.plugin,
     () => this.deps.getSyncFileRules(),
@@ -155,6 +172,15 @@ export class SyncEngine {
       this.reportActivityProgress(progress);
     },
     onConflict: (event) => this.handleSyncConflict(event),
+    onUndecryptablePendingDropped: () => this.noteUndecryptablePendingDropped(),
+    staleEntryResolver: new StaleEntryResolver({
+      crypto: this.deps.crypto,
+      applyRemoteEntryStates: async (states) => {
+        await this.syncPullService.applyRemoteEntryStates(states);
+      },
+      onEntriesDetached: (entryIds) => this.noteEntriesDetached(entryIds),
+    }),
+    onMutationBlocked: (event) => this.handleMutationBlocked(event),
   });
   private readonly syncLocalReconcileService = new SyncLocalReconcileService({
     getSyncStore: () => this.syncStore,
@@ -162,6 +188,7 @@ export class SyncEngine {
     shouldSyncPath: (path) => this.vaultAdapter.isSyncablePath(path),
     scanner: this.vaultAdapter,
     onLocalFilesScanned: (paths) => this.notePortability(paths, { complete: true }),
+    onUndecryptablePendingDropped: () => this.noteUndecryptablePendingDropped(),
   });
   private readonly syncAutoLoop = new SyncAutoLoop({
     getApiBaseUrl: () => this.deps.getApiBaseUrl(),
@@ -207,6 +234,11 @@ export class SyncEngine {
       this.deps.setSyncStatus("up_to_date");
     },
     onError: (error) => {
+      if (isSyncStoreDetachedError(error)) {
+        // Work that outlived a reset or disconnect: not a sync failure.
+        console.info("[osync] sync step stopped: local store detached");
+        return;
+      }
       const decision = this.syncErrorEscalator.recordError(error);
       if (!decision.escalate) {
         // Below the repeat threshold: likely a transient network blip. Keep retrying
@@ -277,6 +309,7 @@ export class SyncEngine {
     onDeviceIssue: (event) => this.handleDeviceIssue(event),
     onDecryptFailure: (entryId) => this.handleDecryptFailure(entryId),
     onEntryDecrypted: (entryId) => this.deviceSyncIssues.forgetUnreadableEntry(entryId),
+    onUndecryptablePendingDropped: () => this.noteUndecryptablePendingDropped(),
     onProgress: async (progress) => {
       this.reportActivityProgress(progress);
     },
@@ -308,9 +341,11 @@ export class SyncEngine {
   constructor(private readonly deps: SyncEngineDeps) {}
 
   setStore(store: SyncStore): void {
-    this.syncStore = store;
+    this.storeHandle?.detach();
+    this.storeHandle = createDetachableSyncStore(store);
+    this.syncStore = this.storeHandle.store;
     this.syncStore.setCorruptionListener(this.corruptionListener);
-    this.cleanupOrphanStoresInBackground(store);
+    this.cleanupOrphanStoresInBackground(this.syncStore);
   }
 
   private cleanupOrphanStoresInBackground(store: SyncStore): void {
@@ -350,10 +385,14 @@ export class SyncEngine {
     return this.syncStore;
   }
 
+  // Hands back the underlying store for closing. Every handle given out before keeps
+  // failing with SyncStoreDetachedError from now on, so work still running against it
+  // cannot touch a store that is being closed or deleted.
   detachStore(): SyncStore | null {
-    const store = this.syncStore;
+    const handle = this.storeHandle;
+    this.storeHandle = null;
     this.syncStore = null;
-    return store;
+    return handle?.detach() ?? null;
   }
 
   async closeStore(): Promise<void> {
@@ -382,6 +421,14 @@ export class SyncEngine {
 
   stopAutoSync(): void {
     this.syncAutoLoop.stop();
+  }
+
+  // Stops auto sync and waits until nothing started before is still running: the
+  // loop's drain and connect, pushes, pulls, scans and queued local work. Callers
+  // that tear down the store (reset, disconnect) await this first.
+  async stopAutoSyncAndWait(): Promise<void> {
+    await this.syncAutoLoop.stopAndWait();
+    await this.drainInFlightSync();
   }
 
   pauseAutoSync(): void {
@@ -589,6 +636,50 @@ export class SyncEngine {
     return (pending?.length ?? 0) > 0;
   }
 
+  // Local changes this device keeps but no longer pushes, with a reason to show.
+  async listBlockedUploads(): Promise<BlockedUpload[]> {
+    const store = this.syncStore;
+    if (!store) {
+      return [];
+    }
+    const blocked: BlockedUpload[] = [];
+    for (const mutation of await store.listBlockedDirtyEntries()) {
+      const local = await store.getLocalStateById(mutation.entryId);
+      const path =
+        local?.path ??
+        (await tryDecryptPendingMetadata(this.deps.crypto, mutation))?.path ??
+        mutation.entryId;
+      blocked.push({
+        entryId: mutation.entryId,
+        path,
+        reason: describeBlockedReason(mutation.blockedReason ?? null),
+      });
+    }
+    return blocked;
+  }
+
+  // Sends changes the server rejected again (a fresh start for their rejection count).
+  // Too-large and over-quota changes stay blocked until the server policy allows them.
+  async retryBlockedUploads(): Promise<number> {
+    const store = this.requireStore();
+    const retryable = (await store.listBlockedDirtyEntries()).filter(
+      (mutation) =>
+        mutation.blockedReason === "repeated_rejection" ||
+        mutation.blockedReason === "unresolved_rejection",
+    );
+    await store.unblockDirtyEntriesByReason("repeated_rejection");
+    await store.unblockDirtyEntriesByReason("unresolved_rejection");
+    await store.flush();
+    if (retryable.length > 0) {
+      this.recordActivity(
+        "resume",
+        `Retrying ${retryable.length} rejected upload${retryable.length === 1 ? "" : "s"}`,
+      );
+      this.notifyLocalChange();
+    }
+    return retryable.length;
+  }
+
   async wipeLocalEntriesForRestore(): Promise<void> {
     const store = this.requireStore();
     for (const local of await store.listLocalStates()) {
@@ -784,6 +875,85 @@ export class SyncEngine {
     return detached.length;
   }
 
+  // A queued change recorded with another vault's key was dropped (by a push, a pull
+  // or a scan). The re-scan that follows first drops every other such change, so the
+  // files on disk are queued again with the current key. Local files are never touched.
+  private noteUndecryptablePendingDropped(): void {
+    this.pendingRescan.dropped += 1;
+    this.scheduleRescan();
+  }
+
+  // A stale change had no readable server state to rebase onto; its entry was
+  // forgotten locally so the re-scan uploads the file as a new entry.
+  private noteEntriesDetached(entryIds: readonly string[]): void {
+    this.pendingRescan.detached += entryIds.length;
+    this.scheduleRescan();
+  }
+
+  // Once the sync step that asked for it is done, log why and run one full local scan.
+  private scheduleRescan(): void {
+    if (this.pendingRescan.queued) {
+      return;
+    }
+    this.pendingRescan.queued = true;
+    void this.runLocalMutationWork(async () => {
+      await this.waitForRemoteSyncActivities();
+      const { dropped, detached } = this.pendingRescan;
+      this.pendingRescan.dropped = 0;
+      this.pendingRescan.detached = 0;
+      this.pendingRescan.queued = false;
+      if (!this.syncStore) {
+        return; // Reset or disconnected meanwhile: nothing left to re-scan.
+      }
+      if (dropped > 0) {
+        this.recordActivity(
+          "scan",
+          `Dropped ${dropped} queued change${dropped === 1 ? "" : "s"} encrypted with an old key; re-scanning files`,
+        );
+      }
+      if (detached > 0) {
+        this.recordActivity(
+          "scan",
+          `Re-uploading ${detached} file${detached === 1 ? "" : "s"} as new entries: their server entries were removed or unreadable`,
+        );
+      }
+      const result = await this.syncLocalReconcileService.reconcileOnce({
+        sanitizePendingMetadata: dropped > 0,
+      });
+      this.recordActivity(
+        "scan",
+        `Re-scan: ${result.filesQueuedForUpsert} upserts, ${result.filesQueuedForDelete} deletes queued (${result.filesScanned} scanned)`,
+      );
+      this.notifyLocalChange();
+    }).catch((error: unknown) => {
+      this.pendingRescan.queued = false;
+      this.recordActivity("error", `Re-scan failed: ${describeActivityError(error)}`);
+    });
+  }
+
+  // The server kept rejecting a change; it is blocked (listed in the sync status) so
+  // the push stops retrying it. The file itself is untouched.
+  private handleMutationBlocked(event: BlockedMutationEvent): void {
+    const target = event.path ?? `entry ${event.entryId}`;
+    this.recordActivity(
+      "error",
+      `Stopped uploading ${target}: the server rejected it ${event.rejections} times (${event.code})`,
+    );
+    this.deps.notify(
+      `Osync: "${target}" couldn't be uploaded. Open sync status to retry.`,
+    );
+  }
+
+  private async waitForRemoteSyncActivities(): Promise<void> {
+    for (;;) {
+      const remote = this.activeSyncActivities.filter((activity) => activity.kind !== "local");
+      if (remote.length === 0) {
+        return;
+      }
+      await Promise.allSettled(remote.map((activity) => activity.done));
+    }
+  }
+
   private notifyNewDeviceIssues(): void {
     const count = this.newDeviceIssuesThisPull;
     this.newDeviceIssuesThisPull = 0;
@@ -931,18 +1101,23 @@ export class SyncEngine {
     if (
       result.mutationsPushed === 0 &&
       result.mutationsRequeued === 0 &&
+      result.mutationsDropped === 0 &&
       result.conflictsCreated === 0
     ) {
       return;
     }
     const requeued =
       result.mutationsRequeued > 0 ? `, ${result.mutationsRequeued} requeued` : "";
+    const dropped =
+      result.mutationsDropped > 0
+        ? `, ${result.mutationsDropped} dropped (old key)`
+        : "";
     const conflicts =
       result.conflictsCreated > 0 ? `, ${result.conflictsCreated} conflicts` : "";
     const more = result.hasMore ? ", more pending" : "";
     this.recordActivity(
       "push",
-      `Pushed ${result.mutationsPushed} changes${requeued}${conflicts} (cursor ${result.cursor})${more}`,
+      `Pushed ${result.mutationsPushed} changes${requeued}${dropped}${conflicts} (cursor ${result.cursor})${more}`,
     );
   }
 
@@ -1053,11 +1228,17 @@ export class SyncEngine {
   // about to detach/close/delete the store (reset, restore) must await this first, or an
   // in-flight pullOnce keeps writing to a store being torn down underneath it.
   async drainInFlightSync(): Promise<void> {
-    await this.waitForLocalMutationWork();
-    const pending = this.activeSyncActivities
-      .filter((activity) => activity.kind !== "local")
-      .map((activity) => activity.done);
-    await Promise.allSettled(pending);
+    // Settled work can queue more (a pull's conflict re-scan, a push's follow-up), so
+    // wait until a pass finds nothing running.
+    for (;;) {
+      const queue = this.localMutationQueue;
+      await queue;
+      const pending = this.activeSyncActivities.map((activity) => activity.done);
+      if (pending.length === 0 && queue === this.localMutationQueue) {
+        return;
+      }
+      await Promise.allSettled(pending);
+    }
   }
 
   private reportActivityProgress(progress: UserVisibleSyncProgress): void {
@@ -1094,6 +1275,27 @@ export class SyncEngine {
 }
 
 export type SyncEngineEntryVersionsPage = SyncEntryVersionsPage;
+
+export interface BlockedUpload {
+  entryId: string;
+  path: string;
+  reason: string;
+}
+
+function describeBlockedReason(reason: PendingMutationBlockedReason | null): string {
+  switch (reason) {
+    case "file_too_large":
+      return "Too large for the server";
+    case "storage_quota_exceeded":
+      return "Storage limit reached";
+    case "repeated_rejection":
+      return "Rejected by the server repeatedly";
+    case "unresolved_rejection":
+      return "Rejected by the server";
+    default:
+      return "Not uploaded";
+  }
+}
 
 export interface InitialCollisionPreview {
   path: string;

@@ -322,6 +322,7 @@ describe("SyncAutoLoop retry flow", () => {
           cursor: 0,
           mutationsPushed: 0,
           mutationsRequeued: 1,
+          mutationsDropped: 0,
           filesCreatedOrUpdated: 0,
           shouldPullAfterPush: true,
           hasMore: true,

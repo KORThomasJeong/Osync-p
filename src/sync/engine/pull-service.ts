@@ -4,12 +4,13 @@ import { SyncPullClient } from "../remote/pull-client";
 import type { SyncCryptoService } from "../core/crypto-service";
 import type { SyncFileRules } from "../core/file-rules";
 import type { DevicePathPolicy } from "../core/path-portability";
+import type { RemoteEntryState } from "../remote/changes";
 import type { SyncRealtimeSession } from "../remote/realtime-client";
 import type {
   SyncCursorStore,
   SyncStoreLifecycle,
 } from "../store/ports";
-import type { SyncProgressCounts } from "../store/store";
+import type { PendingMutationRow, SyncProgressCounts } from "../store/store";
 import {
   type PullConflictEvent,
   type PullDeviceIssueEvent,
@@ -41,6 +42,8 @@ export interface SyncPullServiceDeps {
   onDecryptFailure?: (entryId: string) => void;
   // Notified (best-effort) for every remote entry whose metadata decrypted.
   onEntryDecrypted?: (entryId: string) => void;
+  // A queued local change this key cannot decrypt was dropped during the pull.
+  onUndecryptablePendingDropped?: (mutation: PendingMutationRow) => void;
   now?: () => number;
   isInitialDownloadSync?: () => Promise<boolean>;
   onInitialPullComplete?: () => Promise<void>;
@@ -82,6 +85,7 @@ export class SyncPullService {
       onConflict: this.deps.onConflict,
       onDecryptFailure: this.deps.onDecryptFailure,
       onEntryDecrypted: this.deps.onEntryDecrypted,
+      onUndecryptablePendingDropped: this.deps.onUndecryptablePendingDropped,
       now: this.deps.now,
       getSyncFileRules: this.deps.getSyncFileRules,
       getDevicePathPolicy: this.deps.getDevicePathPolicy,
@@ -206,6 +210,22 @@ export class SyncPullService {
       filesDeleted: totals.filesDeleted,
       conflictsCreated: totals.conflictsCreated,
     };
+  }
+
+  // Applies the given entry states exactly as a pull would (conflicts, merges and
+  // rebasing of queued local changes included) without touching the cursor. Used to
+  // resolve a stale commit whose newer entry state lies below the cursor.
+  async applyRemoteEntryStates(states: RemoteEntryState[]): Promise<void> {
+    if (states.length === 0) {
+      return;
+    }
+    const store = this.deps.getSyncStore();
+    if (!store) {
+      throw new Error("Sync store is not initialized.");
+    }
+    const token = await this.deps.getSyncToken();
+    await this.entryStateApplier.applyEntryStates(store, token, states);
+    await store.flush();
   }
 
   private async checkpointAppliedWindow(

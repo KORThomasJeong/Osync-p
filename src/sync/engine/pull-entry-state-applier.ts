@@ -67,6 +67,9 @@ export interface PullEntryStateApplierDeps {
   // Notified (best-effort) for every remote entry whose metadata decrypted, so a
   // previously recorded decrypt failure for it can be cleared.
   onEntryDecrypted?: (entryId: string) => void;
+  // A queued local change whose metadata the current key cannot decrypt was dropped
+  // because the remote changed the same entry (see undecryptable-pending.ts).
+  onUndecryptablePendingDropped?: (mutation: PendingMutationRow) => void;
   // When provided, remote entries whose path is not syncable on this device
   // (e.g. inside an excluded folder) are recorded in the store but never written
   // to or deleted from disk — so they stop churning the vault while still

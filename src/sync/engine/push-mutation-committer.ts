@@ -1,5 +1,4 @@
 import { hashBytes } from "../core/content";
-import type { SyncedEntryMetadata } from "../core/content";
 import { writeConflictCopy } from "../core/conflict-file";
 import { queueLocalUpsertMutation, resolveEditedAt } from "../core/mutation-queue";
 import { SyncBlobClient, SyncBlobUploadError } from "../remote/blob-client";
@@ -23,6 +22,10 @@ import {
   toCommitPayload,
 } from "./push-mutation-shared";
 import { isAutoMergeTextPath } from "./text-merge-policy";
+import {
+  dropUndecryptablePendingMutation,
+  tryDecryptPendingMetadata,
+} from "./undecryptable-pending";
 import type {
   PreparedPushMutation,
   PreparePushMutationResult,
@@ -84,6 +87,15 @@ export class PushMutationCommitter {
     maxFileSizeBytes: number,
     storageAvailableBytes: number | null = null,
   ): Promise<PreparePushMutationResult> {
+    // Every op is checked, deletes and folders included: metadata this key cannot
+    // decrypt must never be committed (no device could read it on the server), and
+    // retrying it would fail the same way forever.
+    const metadata = await tryDecryptPendingMetadata(this.deps.crypto, mutation);
+    if (!metadata) {
+      await this.dropUndecryptable(store, mutation);
+      return { skipped: true, reason: "undecryptable" };
+    }
+
     if (mutation.op === "delete") {
       return {
         commitPayload: toCommitPayload(mutation),
@@ -102,20 +114,6 @@ export class PushMutationCommitter {
       };
     }
 
-    let metadata: SyncedEntryMetadata;
-    try {
-      metadata = await this.deps.crypto.decryptMetadata(
-        mutation.encryptedMetadata,
-        metadataContextFromMutation(mutation),
-      );
-    } catch (error) {
-      const ctx = metadataContextFromMutation(mutation);
-      console.error(
-        `[osync] push: failed to decrypt pending mutation ${mutation.mutationId} entry=${ctx.entryId} rev=${ctx.revision} op=${ctx.op} blobId=${ctx.blobId ?? "null"}`,
-        error,
-      );
-      throw error;
-    }
     const bytes = await this.deps.fileReader.readBytes(metadata.path);
     if (!mutation.blobId) {
       throw new Error(`Upsert mutation ${mutation.mutationId} is missing a blobId.`);
@@ -434,10 +432,11 @@ export class PushMutationCommitter {
       hash: string | null;
     },
   ): Promise<void> {
-    const metadata = await this.deps.crypto.decryptMetadata(
-      pending.encryptedMetadata,
-      metadataContextFromMutation(pending),
-    );
+    const metadata = await tryDecryptPendingMetadata(this.deps.crypto, pending);
+    if (!metadata) {
+      await this.dropUndecryptable(store, pending);
+      return;
+    }
     await store.updateDirtyEntry({
       ...pending,
       baseRevision: acceptedBase.revision,
@@ -543,6 +542,18 @@ export class PushMutationCommitter {
       console.warn(
         `[osync] dropped local entryId=${mutation.entryId} after path_already_exists rejection without conflictingEntryId`,
       );
+    }
+  }
+
+  private async dropUndecryptable(
+    store: PushMutationStore,
+    mutation: PendingMutationRow,
+  ): Promise<void> {
+    await dropUndecryptablePendingMutation(store, mutation);
+    try {
+      this.deps.onUndecryptablePendingDropped?.(mutation);
+    } catch (error) {
+      console.error("[osync] push: dropped-mutation listener failed", error);
     }
   }
 

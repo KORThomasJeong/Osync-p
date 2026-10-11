@@ -354,6 +354,7 @@ describe("SyncEngine", () => {
         cursor: 0,
         mutationsPushed: 0,
         mutationsRequeued: 0,
+        mutationsDropped: 0,
         filesCreatedOrUpdated: 0,
         filesDeleted: 0,
         conflictsCreated: 0,
@@ -367,6 +368,7 @@ describe("SyncEngine", () => {
         cursor: 9,
         mutationsPushed: 4,
         mutationsRequeued: 0,
+        mutationsDropped: 0,
         filesCreatedOrUpdated: 4,
         filesDeleted: 0,
         conflictsCreated: 0,
@@ -421,6 +423,146 @@ describe("SyncEngine", () => {
       const plugin = createPlugin({}, async () => encodeUtf8(""));
       const engine = createEngine(plugin);
       expect(await engine.countPendingMutations()).toBe(0);
+    });
+  });
+
+  describe("queued changes encrypted with an old key", () => {
+    type DropListener = { onUndecryptablePendingDropped: (mutation: unknown) => void };
+    const internals = (engine: SyncEngine) =>
+      engine as unknown as {
+        syncPushService: { deps: DropListener };
+        syncPullService: { deps: DropListener };
+        syncLocalReconcileService: {
+          deps: DropListener;
+          reconcileOnce: (options?: unknown) => Promise<unknown>;
+        };
+      };
+
+    it("logs the drops once and re-scans local files with the queue sanitized", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const store = await createInitializedTestSyncStore(plugin);
+      const recordActivity = vi.fn();
+      const engine = createEngine(plugin, { recordActivity });
+      engine.setStore(store);
+      const reconcile = vi
+        .spyOn(internals(engine).syncLocalReconcileService, "reconcileOnce")
+        .mockResolvedValue({ filesScanned: 2, filesQueuedForUpsert: 2, filesQueuedForDelete: 0 });
+      const notifyLocalChange = vi.spyOn(engine, "notifyLocalChange");
+
+      // One drop from the push, one from a pull and one from a scan, all in one go.
+      internals(engine).syncPushService.deps.onUndecryptablePendingDropped({});
+      internals(engine).syncPullService.deps.onUndecryptablePendingDropped({});
+      internals(engine).syncLocalReconcileService.deps.onUndecryptablePendingDropped({});
+      await engine.waitForLocalMutationWork();
+
+      expect(recordActivity).toHaveBeenCalledWith(
+        "scan",
+        "Dropped 3 queued changes encrypted with an old key; re-scanning files",
+      );
+      expect(reconcile).toHaveBeenCalledTimes(1);
+      expect(reconcile).toHaveBeenCalledWith({ sanitizePendingMetadata: true });
+      expect(notifyLocalChange).toHaveBeenCalled();
+      await store.close();
+    });
+
+    it("re-scans after a stale change was re-created as a new entry", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const store = await createInitializedTestSyncStore(plugin);
+      const recordActivity = vi.fn();
+      const engine = createEngine(plugin, { recordActivity });
+      engine.setStore(store);
+      const reconcile = vi
+        .spyOn(internals(engine).syncLocalReconcileService, "reconcileOnce")
+        .mockResolvedValue({ filesScanned: 1, filesQueuedForUpsert: 1, filesQueuedForDelete: 0 });
+      const resolverDeps = (
+        engine as unknown as {
+          syncPushService: {
+            deps: { staleEntryResolver: { deps: { onEntriesDetached: (ids: string[]) => void } } };
+          };
+        }
+      ).syncPushService.deps.staleEntryResolver.deps;
+
+      resolverDeps.onEntriesDetached(["entry-1", "entry-2"]);
+      await engine.waitForLocalMutationWork();
+
+      expect(recordActivity).toHaveBeenCalledWith(
+        "scan",
+        "Re-uploading 2 files as new entries: their server entries were removed or unreadable",
+      );
+      expect(reconcile).toHaveBeenCalledWith({ sanitizePendingMetadata: false });
+      await store.close();
+    });
+
+    it("records and announces a change blocked after repeated rejections", () => {
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const recordActivity = vi.fn();
+      const notify = vi.fn();
+      const engine = createEngine(plugin, { recordActivity, notify });
+      const pushDeps = (
+        engine as unknown as {
+          syncPushService: { deps: { onMutationBlocked: (event: unknown) => void } };
+        }
+      ).syncPushService.deps;
+
+      pushDeps.onMutationBlocked({
+        entryId: "entry-1",
+        path: "notes/a.md",
+        code: "stale_revision",
+        rejections: 5,
+      });
+
+      expect(recordActivity).toHaveBeenCalledWith(
+        "error",
+        "Stopped uploading notes/a.md: the server rejected it 5 times (stale_revision)",
+      );
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("notes/a.md"));
+    });
+  });
+
+  describe("blocked uploads", () => {
+    it("lists blocked local changes with a readable reason and retries the rejected ones", async () => {
+      const plugin = createPlugin({}, async () => encodeUtf8(""));
+      const store = await createInitializedTestSyncStore(plugin);
+      const engine = createEngine(plugin);
+      engine.setStore(store);
+      const notifyLocalChange = vi.spyOn(engine, "notifyLocalChange");
+      for (const [entryId, path, reason] of [
+        ["entry-a", "notes/a.md", "repeated_rejection"],
+        ["entry-b", "big.zip", "file_too_large"],
+      ] as const) {
+        await store.applyLocalState({
+          entryId,
+          path,
+          blobId: `blob-${entryId}`,
+          hash: `hash-${entryId}`,
+          deleted: false,
+          updatedAt: 1,
+          localMtime: 1,
+          localSize: 1,
+        });
+        await store.markEntryDirty({
+          mutationId: `mutation-${entryId}`,
+          entryId,
+          op: "upsert",
+          status: "blocked",
+          blockedReason: reason,
+          baseRevision: 0,
+          blobId: `blob-${entryId}`,
+          hash: `hash-${entryId}`,
+          encryptedMetadata: "unused",
+          createdAt: 1,
+        });
+      }
+
+      expect(await engine.listBlockedUploads()).toEqual([
+        { entryId: "entry-a", path: "notes/a.md", reason: "Rejected by the server repeatedly" },
+        { entryId: "entry-b", path: "big.zip", reason: "Too large for the server" },
+      ]);
+
+      expect(await engine.retryBlockedUploads()).toBe(1);
+      expect((await store.listDirtyEntries()).map((row) => row.entryId)).toEqual(["entry-a"]);
+      expect(notifyLocalChange).toHaveBeenCalled();
+      await store.close();
     });
   });
 

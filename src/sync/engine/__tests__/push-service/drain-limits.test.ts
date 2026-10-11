@@ -80,6 +80,7 @@ describe("SyncPushService drain: limits", () => {
       cursor: 0,
       mutationsPushed: 0,
       mutationsRequeued: 0,
+      mutationsDropped: 0,
       filesCreatedOrUpdated: 0,
       filesDeleted: 0,
       conflictsCreated: 0,
@@ -341,6 +342,7 @@ describe("SyncPushService drain: limits", () => {
     await expect(service.pushPendingMutations(session)).resolves.toMatchObject({
       mutationsPushed: 0,
       mutationsRequeued: 0,
+      mutationsDropped: 0,
       hasMore: false,
     });
     expect(uploadAttempts).toBe(1);

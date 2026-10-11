@@ -11,7 +11,6 @@ import {
 import { decideConflictWinner } from "./conflict-tiebreak";
 import {
   decodeUtf8,
-  metadataContextFromPendingMutation,
   type PlannedEntryState,
   type PreparedEntryBlob,
   type PreparedPendingConflict,
@@ -24,6 +23,7 @@ import type {
 } from "./pull-entry-state-applier";
 import { mergeText3 } from "./text-merge";
 import { isAutoMergeTextPath } from "./text-merge-policy";
+import { tryDecryptPendingMetadata } from "./undecryptable-pending";
 
 export class PullPendingMutationHandler {
   constructor(private readonly deps: PullEntryStateApplierDeps) {}
@@ -38,10 +38,10 @@ export class PullPendingMutationHandler {
       return null;
     }
 
-    const metadata = await this.deps.crypto.decryptMetadata(
-      pending.encryptedMetadata,
-      metadataContextFromPendingMutation(pending),
-    );
+    const metadata = await tryDecryptPendingMetadata(this.deps.crypto, pending);
+    if (!metadata) {
+      return await this.prepareUndecryptablePendingConflict(store, plan, pending, remoteBlob);
+    }
     if (
       await isSameEntryPendingMutationAlreadyRemote(
         pending,
@@ -111,7 +111,17 @@ export class PullPendingMutationHandler {
           conflictPath: backupPath,
         },
         conflictBytes: backupBytes,
-        merge: { kind: "rebase-client" },
+        merge: {
+          kind: "rebase-client",
+          // The metadata is bound (AAD) to the revision it commits as; keeping the
+          // old ciphertext with a new base left a row no push could ever decrypt.
+          encryptedMetadata: await this.deps.crypto.encryptMetadata(metadata, {
+            entryId: pending.entryId,
+            revision: plan.state.revision + 1,
+            op: pending.op,
+            blobId: pending.blobId,
+          }),
+        },
       };
     }
 
@@ -191,6 +201,7 @@ export class PullPendingMutationHandler {
         baseRevision: prepared.plan.state.revision,
         baseBlobId: prepared.plan.state.blobId,
         baseHash: prepared.plan.hash,
+        encryptedMetadata: prepared.merge.encryptedMetadata,
       };
       await store.replaceDirtyEntry(rebased, { requireBaseBlob: false });
       if (prepared.event) {
@@ -322,16 +333,75 @@ export class PullPendingMutationHandler {
     }
 
     for (const pending of await store.listDirtyEntries()) {
-      const metadata = await this.deps.crypto.decryptMetadata(
-        pending.encryptedMetadata,
-        metadataContextFromPendingMutation(pending),
-      );
-      if (candidatePaths.has(metadata.path)) {
+      // A row this key cannot read has no known path; the push drops it.
+      const metadata = await tryDecryptPendingMetadata(this.deps.crypto, pending);
+      if (metadata && candidatePaths.has(metadata.path)) {
         return pending;
       }
     }
 
     return null;
+  }
+
+  // The remote changed an entry whose queued local change this key cannot decrypt
+  // (recorded with another vault's key). That change can never be committed, so the
+  // remote version wins — but the file on disk is the user's latest content: when it
+  // differs from the remote it is kept as a conflict copy (path from the local state,
+  // which needs no decryption), and the queued row is dropped.
+  private async prepareUndecryptablePendingConflict(
+    store: PullEntryStateStore,
+    plan: PlannedEntryState,
+    pending: PendingMutationRow,
+    remoteBlob: PreparedEntryBlob | null,
+  ): Promise<PreparedPendingConflict> {
+    this.notifyUndecryptableDropped(pending);
+    const localPath = (await store.getLocalStateById(pending.entryId))?.path ?? null;
+    let conflictBytes: Uint8Array | null = null;
+    let conflictPath: string | null = null;
+    if (
+      pending.op === "upsert" &&
+      localPath &&
+      (await this.deps.vaultAdapter.exists(localPath))
+    ) {
+      const localBytes = await this.deps.vaultAdapter.readBytes(localPath);
+      const sameAsRemote =
+        !plan.state.deleted &&
+        plan.finalPath === localPath &&
+        !!remoteBlob &&
+        (await hashBytes(localBytes)) === plan.hash;
+      if (!sameAsRemote) {
+        conflictBytes = localBytes;
+        conflictPath = await getAvailableConflictCopyPath(
+          this.deps.vaultAdapter,
+          localPath,
+          this.deps.now,
+        );
+      }
+    }
+    if (!conflictPath) {
+      return { plan, pending, event: null, conflictBytes: null, merge: { kind: "remote" } };
+    }
+    return {
+      plan,
+      pending,
+      event: {
+        entryId: pending.entryId,
+        op: pending.op,
+        reason: "local_pending_mutation",
+        originalPath: localPath ?? plan.finalPath ?? plan.metadata.path,
+        conflictPath,
+      },
+      conflictBytes,
+      merge: null,
+    };
+  }
+
+  private notifyUndecryptableDropped(pending: PendingMutationRow): void {
+    try {
+      this.deps.onUndecryptablePendingDropped?.(pending);
+    } catch (error) {
+      console.error("[osync] pull: dropped-mutation listener failed", error);
+    }
   }
 }
 

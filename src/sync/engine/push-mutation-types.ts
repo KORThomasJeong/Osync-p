@@ -12,7 +12,7 @@ import type {
   SyncMutationStore,
   SyncRemoteEntryStore,
 } from "../store/ports";
-import type { SyncProgressCounts } from "../store/store";
+import type { PendingMutationRow, SyncProgressCounts } from "../store/store";
 import type { ConflictResolutionPolicy } from "./conflict-resolution-policy";
 
 export interface PushMutationCommitterDeps {
@@ -23,6 +23,8 @@ export interface PushMutationCommitterDeps {
   conflictFileWriter?: ConflictFileWriter;
   blobClient?: SyncBlobClient;
   onConflict?: (event: PushConflictEvent) => void;
+  // A queued change whose metadata the current key cannot decrypt was dropped.
+  onUndecryptablePendingDropped?: (mutation: PendingMutationRow) => void;
   now?: () => number;
 }
 
@@ -78,7 +80,7 @@ export interface PreparedPushMutation {
 export interface PushMutationStore
   extends Pick<SyncEntryStore, "getEntryById" | "deleteEntry">,
     Pick<SyncRemoteEntryStore, "applyRemoteState" | "getRemoteStateById">,
-    Pick<SyncLocalEntryStore, "applyLocalState" | "getLocalStateById">,
+    Pick<SyncLocalEntryStore, "applyLocalState" | "clearLocalState" | "getLocalStateById">,
     Pick<
       SyncMutationStore,
       | "clearDirtyEntryByMutationId"
@@ -90,7 +92,8 @@ export interface PushMutationStore
 
 export interface SkippedPushMutation {
   skipped: true;
-  reason: "file_too_large" | "storage_quota_exceeded";
+  // undecryptable: the queued row was dropped (see undecryptable-pending.ts).
+  reason: "file_too_large" | "storage_quota_exceeded" | "undecryptable";
 }
 
 export type PreparePushMutationResult = PreparedPushMutation | SkippedPushMutation | null;

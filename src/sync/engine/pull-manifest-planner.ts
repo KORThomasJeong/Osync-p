@@ -15,10 +15,10 @@ import type {
 } from "../store/ports";
 import { toPathKey } from "../store/dexie/path-key";
 import { decideConflictWinner } from "./conflict-tiebreak";
+import { tryDecryptPendingMetadata } from "./undecryptable-pending";
 import {
   type AdoptedLocalEntry,
   isDeferredByCursorThreshold,
-  metadataContextFromPendingMutation,
   type PlannedEntryState,
   type PullConflictEvent,
   type PullEntryStateManifestItem,
@@ -170,11 +170,9 @@ export class PullManifestPlanner {
             const localOwnerPending = pathOwner
               ? await store.getDirtyEntryMutation(pathOwner.entryId)
               : null;
+            // Unreadable with this key (old-key row): no editedAt evidence.
             const localPendingMeta = localOwnerPending
-              ? await this.deps.crypto.decryptMetadata(
-                  localOwnerPending.encryptedMetadata,
-                  metadataContextFromPendingMutation(localOwnerPending),
-                )
+              ? await tryDecryptPendingMetadata(this.deps.crypto, localOwnerPending)
               : null;
             pathConflict = await this.createPathCollisionEvent(
               state.entryId,
@@ -318,11 +316,8 @@ export class PullManifestPlanner {
       return null;
     }
 
-    const pendingMetadata = await this.deps.crypto.decryptMetadata(
-      pending.encryptedMetadata,
-      metadataContextFromPendingMutation(pending),
-    );
-    if (pendingMetadata.path !== metadata.path || !pendingMetadata.hash) {
+    const pendingMetadata = await tryDecryptPendingMetadata(this.deps.crypto, pending);
+    if (!pendingMetadata || pendingMetadata.path !== metadata.path || !pendingMetadata.hash) {
       return null;
     }
 

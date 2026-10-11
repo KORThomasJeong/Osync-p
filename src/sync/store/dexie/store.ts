@@ -408,6 +408,14 @@ export class DexieSyncStore implements SyncStore {
     return rows.map((row) => toPendingMutationRow(row)).filter(isPresent);
   }
 
+  async listBlockedDirtyEntries(): Promise<PendingMutationRow[]> {
+    const rows = await this.db.entries.where("pendingStatus").equals("blocked").toArray();
+    return rows
+      .map((row) => toPendingMutationRow(row))
+      .filter(isPresent)
+      .sort((left, right) => left.createdAt - right.createdAt);
+  }
+
   async updateDirtyEntry(mutation: PendingMutationRow): Promise<void> {
     await this.markEntryDirty(mutation);
   }
