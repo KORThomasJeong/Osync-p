@@ -251,7 +251,14 @@ export class SyncPushService {
           if (result.status === "conflict") {
             continue;
           }
-          cursor = Math.max(cursor, result.accepted.cursor);
+          // Our own commit only extends the local cursor when it follows it without a
+          // gap. A gap means another device committed in between and we have not pulled
+          // it yet; jumping past it would make the next pull skip those changes forever.
+          if (result.accepted.cursor === cursor + 1) {
+            cursor = result.accepted.cursor;
+          } else if (result.accepted.cursor > cursor) {
+            shouldPullAfterPush = true;
+          }
           filesCreatedOrUpdated += result.filesCreatedOrUpdated;
           filesDeleted += result.filesDeleted;
           mutationsPushed += 1;

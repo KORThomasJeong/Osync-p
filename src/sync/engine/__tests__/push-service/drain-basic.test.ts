@@ -19,6 +19,8 @@ describe("SyncPushService drain: basic queue", () => {
   it("flushes queued mutations and updates the local store", async () => {
     const plugin = createTestPlugin();
     const store = await createInitializedTestSyncStore(plugin);
+    // Up to date with the server (cursor 10), so our commits 11 and 12 follow it.
+    await store.setCursor(10);
     const upsertHash = await hashBytes(encodeUtf8("new body"));
     const upsertBlobId = "blob-upsert-uuid";
     await store.markEntryDirty({
