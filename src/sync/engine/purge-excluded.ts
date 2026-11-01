@@ -1,4 +1,4 @@
-import { matchesSyncFileRules, type SyncFileRules } from "../core/file-rules";
+import { matchesSyncEntryRules, type SyncFileRules } from "../core/file-rules";
 import type { RemoteSyncEntryRow } from "../store/store";
 
 // Live remote entries whose path this device's file rules exclude (e.g. an excluded
@@ -12,6 +12,9 @@ export function findExcludedRemoteEntries(
 ): RemoteSyncEntryRow[] {
   return remoteStates.filter(
     (state) =>
-      !state.deleted && state.path !== null && !matchesSyncFileRules(state.path, rules),
+      !state.deleted &&
+      state.path !== null &&
+      // A folder is judged by folder rules: the file-type toggles say nothing about it.
+      !matchesSyncEntryRules(state.path, rules, state.entryType ?? "file"),
   );
 }

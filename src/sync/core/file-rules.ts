@@ -81,8 +81,9 @@ export function shouldSyncPath(
   path: string,
   rules: SyncFileRules,
   device?: DevicePathPolicy,
+  kind: SyncEntryKind = "file",
 ): boolean {
-  if (!matchesSyncFileRules(path, rules)) {
+  if (!matchesSyncEntryRules(path, rules, kind)) {
     return false;
   }
 
@@ -90,6 +91,44 @@ export function shouldSyncPath(
   return device
     ? device.describeUnwritable(normalizedPath) === null
     : isPathWithinSyncLimits(normalizedPath);
+}
+
+export type SyncEntryKind = "file" | "folder";
+
+// The user-configured rules for an entry of the given kind. Folders carry no file
+// extension, so the file-type toggles (images, "other files", …) must not decide them:
+// without this, a device with "other files" off treated every folder as excluded, so
+// folder deletes/renames were never pushed or applied and emptied folders lingered on
+// every other device.
+export function matchesSyncEntryRules(
+  path: string,
+  rules: SyncFileRules,
+  kind: SyncEntryKind = "file",
+): boolean {
+  return kind === "folder" ? matchesSyncFolderRules(path, rules) : matchesSyncFileRules(path, rules);
+}
+
+// A folder follows only the structural rules: not inside an excluded folder, and hidden
+// only when it belongs to the synced Obsidian config tree (never the Osync plugin's own).
+export function matchesSyncFolderRules(path: string, rules: SyncFileRules): boolean {
+  const normalizedPath = normalizeVaultPath(path);
+  if (!normalizedPath) {
+    return false;
+  }
+
+  if (isExcludedByFolder(normalizedPath, rules.excludedFolders)) {
+    return false;
+  }
+
+  if (hasHiddenSegment(normalizedPath)) {
+    return (
+      rules.includeObsidianConfig &&
+      isObsidianConfigPath(normalizedPath) &&
+      !isOsyncPluginPath(normalizedPath)
+    );
+  }
+
+  return true;
 }
 
 // The user-configured rules only (file types, excluded folders, config files) with no

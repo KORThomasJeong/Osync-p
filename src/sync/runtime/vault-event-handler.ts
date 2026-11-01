@@ -115,7 +115,7 @@ export class SyncVaultEventHandler {
         const syncableFolder = this.deps.vaultAdapter.asSyncableFolder(file);
         if (syncableFolder) {
           this.notePathSeen(syncableFolder.path);
-          const renamedFromSyncable = this.deps.vaultAdapter.isSyncablePath(oldPath);
+          const renamedFromSyncable = this.deps.vaultAdapter.isSyncablePath(oldPath, "folder");
           this.run(async () => {
             if (renamedFromSyncable) {
               const changed = await this.deps.eventRecorder.recordFolderRename(oldPath, syncableFolder.path);

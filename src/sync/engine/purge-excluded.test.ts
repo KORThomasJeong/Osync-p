@@ -54,3 +54,22 @@ describe("findExcludedRemoteEntries", () => {
     expect(findExcludedRemoteEntries(states, rules).map((s) => s.entryId)).toEqual(["drop"]);
   });
 });
+
+describe("findExcludedRemoteEntries with folder entries", () => {
+  it("never purges ordinary folders just because 'other files' is off", () => {
+    const rules = { ...DEFAULT_SYNC_FILE_RULES, includeOtherFiles: false };
+    const states = [
+      remote({ entryId: "folder", path: "30-Resources/AI", entryType: "folder", blobId: null, hash: null }),
+      remote({ entryId: "file", path: "30-Resources/AI/x.bin", entryType: "file" }),
+    ];
+    expect(findExcludedRemoteEntries(states, rules).map((s) => s.entryId)).toEqual(["file"]);
+  });
+
+  it("still purges folders inside an excluded folder", () => {
+    const rules = { ...DEFAULT_SYNC_FILE_RULES, excludedFolders: ["Wiki/_retrieval"] };
+    const states = [
+      remote({ entryId: "f", path: "Wiki/_retrieval/sub", entryType: "folder", blobId: null, hash: null }),
+    ];
+    expect(findExcludedRemoteEntries(states, rules).map((s) => s.entryId)).toEqual(["f"]);
+  });
+});

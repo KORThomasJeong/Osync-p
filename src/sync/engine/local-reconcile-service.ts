@@ -50,7 +50,7 @@ export interface SyncLocalReconcileServiceDeps {
   getSyncStore: () => SyncLocalReconcileStore | null;
   crypto: SyncCryptoService;
   scanner: LocalFileScanner;
-  shouldSyncPath(path: string): boolean;
+  shouldSyncPath(path: string, kind?: "file" | "folder"): boolean;
   prepareConcurrency?: number;
   // Every syncable local file path of a completed scan (e.g. for portability warnings).
   onLocalFilesScanned?: (paths: readonly string[]) => void;
@@ -417,7 +417,11 @@ export class SyncLocalReconcileService {
     const retainedEntries: LocalSyncEntryRow[] = [];
 
     for (const entry of knownEntries) {
-      if (!entry.path || entry.deleted || this.deps.shouldSyncPath(entry.path)) {
+      if (
+        !entry.path ||
+        entry.deleted ||
+        this.deps.shouldSyncPath(entry.path, entry.entryType ?? "file")
+      ) {
         retainedEntries.push(entry);
         continue;
       }

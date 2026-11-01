@@ -197,7 +197,7 @@ export class SyncEngine {
   private readonly syncLocalReconcileService = new SyncLocalReconcileService({
     getSyncStore: () => this.syncStore,
     crypto: this.deps.crypto,
-    shouldSyncPath: (path) => this.vaultAdapter.isSyncablePath(path),
+    shouldSyncPath: (path, kind) => this.vaultAdapter.isSyncablePath(path, kind),
     scanner: this.vaultAdapter,
     onLocalFilesScanned: (paths) => this.notePortability(paths, { complete: true }),
     onUndecryptablePendingDropped: () => this.noteUndecryptablePendingDropped(),
@@ -1185,7 +1185,7 @@ export class SyncEngine {
       return; // Deleted or moved away since; nothing left to write here.
     }
     const path = remote.path;
-    if (!this.vaultAdapter.isSyncablePath(path)) {
+    if (!this.vaultAdapter.isSyncablePath(path, remote.entryType ?? "file")) {
       // Excluded by the user's rules now, or a path this device can never hold.
       const reason = this.deviceSyncIssues.describeUnwritable(path);
       if (reason) {

@@ -1,6 +1,6 @@
 import { TAbstractFile, TFile, TFolder } from "obsidian";
 
-import type { SyncFileRules } from "../core/file-rules";
+import type { SyncEntryKind, SyncFileRules } from "../core/file-rules";
 import { normalizeVaultPath, shouldSyncPath } from "../core/file-rules";
 import type { DevicePathPolicy } from "../core/path-portability";
 
@@ -17,7 +17,7 @@ export function asSyncableFolder(
   rules: SyncFileRules,
   device?: DevicePathPolicy,
 ): TFolder | null {
-  return file instanceof TFolder && isSyncableVaultPath(file.path, rules, device)
+  return file instanceof TFolder && isSyncableVaultPath(file.path, rules, device, "folder")
     ? file
     : null;
 }
@@ -26,9 +26,10 @@ export function isSyncableVaultPath(
   path: string,
   rules: SyncFileRules,
   device?: DevicePathPolicy,
+  kind: SyncEntryKind = "file",
 ): boolean {
   const normalized = normalizeVaultPath(path);
-  return !!normalized && shouldSyncPath(normalized, rules, device);
+  return !!normalized && shouldSyncPath(normalized, rules, device, kind);
 }
 
 export function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {

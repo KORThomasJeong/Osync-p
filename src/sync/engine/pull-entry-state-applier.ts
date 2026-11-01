@@ -20,7 +20,7 @@ import {
   removeVaultPathIfExists,
   type SyncVaultWriter,
 } from "../vault/vault-writer";
-import { matchesSyncFileRules, type SyncFileRules } from "../core/file-rules";
+import { matchesSyncEntryRules, type SyncEntryKind, type SyncFileRules } from "../core/file-rules";
 import {
   describeDeviceWriteIssue,
   type DevicePathPolicy,
@@ -159,15 +159,18 @@ export class PullEntryStateApplier {
   // that this device cannot hold (see describeDeviceIssue), must not touch the disk on
   // pull. The remote state is still recorded so the cursor advances and the entry is
   // not re-downloaded on every subsequent pull.
-  private isDiskWritablePath(path: string | null | undefined): boolean {
+  private isDiskWritablePath(
+    path: string | null | undefined,
+    kind: SyncEntryKind = "file",
+  ): boolean {
     if (!path) return false;
-    if (!this.matchesUserRules(path)) return false;
+    if (!this.matchesUserRules(path, kind)) return false;
     return this.describeDeviceIssue(path) === null;
   }
 
-  private matchesUserRules(path: string): boolean {
+  private matchesUserRules(path: string, kind: SyncEntryKind = "file"): boolean {
     const getRules = this.deps.getSyncFileRules;
-    return !getRules || matchesSyncFileRules(path, getRules());
+    return !getRules || matchesSyncEntryRules(path, getRules(), kind);
   }
 
   private describeDeviceIssue(path: string): string | null {
@@ -620,11 +623,11 @@ export class PullEntryStateApplier {
 
             if (plan.state.deleted) {
               const deletePath = plan.existing?.path ?? plan.metadata.path;
-              if (deletePath && this.isDiskWritablePath(deletePath)) {
+              if (deletePath && this.isDiskWritablePath(deletePath, "folder")) {
                 foldersToDelete.push(deletePath);
               }
             } else if (plan.finalPath) {
-              if (this.isDiskWritablePath(plan.finalPath)) {
+              if (this.isDiskWritablePath(plan.finalPath, "folder")) {
                 try {
                   if (!(await this.deps.vaultAdapter.exists(plan.finalPath))) {
                     await this.deps.vaultAdapter.mkdir(plan.finalPath);
@@ -649,7 +652,7 @@ export class PullEntryStateApplier {
                 }
               }
               const oldPath = plan.existing?.path;
-              if (oldPath && oldPath !== plan.finalPath && this.isDiskWritablePath(oldPath)) {
+              if (oldPath && oldPath !== plan.finalPath && this.isDiskWritablePath(oldPath, "folder")) {
                 foldersToDelete.push(oldPath);
               }
             }

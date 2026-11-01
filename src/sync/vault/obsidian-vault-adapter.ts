@@ -1,7 +1,7 @@
 import { TFolder } from "obsidian";
 import type { Plugin, TAbstractFile, TFile } from "obsidian";
 
-import type { SyncFileRules } from "../core/file-rules";
+import type { SyncEntryKind, SyncFileRules } from "../core/file-rules";
 import type { DevicePathPolicy } from "../core/path-portability";
 import { asSyncableFile, asSyncableFolder, isSyncableVaultPath, toArrayBuffer } from "./vault-files";
 
@@ -41,13 +41,13 @@ export class ObsidianSyncVaultAdapter {
       .getAllLoadedFiles()
       .filter(
         (f): f is TFolder =>
-          f instanceof TFolder && f.path !== "/" && this.isSyncablePath(f.path),
+          f instanceof TFolder && f.path !== "/" && this.isSyncablePath(f.path, "folder"),
       )
       .map((f) => f.path);
   }
 
-  isSyncablePath(path: string): boolean {
-    return isSyncableVaultPath(path, this.getSyncFileRules(), this.getDevicePathPolicy?.());
+  isSyncablePath(path: string, kind: SyncEntryKind = "file"): boolean {
+    return isSyncableVaultPath(path, this.getSyncFileRules(), this.getDevicePathPolicy?.(), kind);
   }
 
   async listFiles(): Promise<SyncVaultFile[]> {

@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_SYNC_FILE_RULES,
+  matchesSyncEntryRules,
   matchesSyncFileRules,
+  matchesSyncFolderRules,
   normalizeExcludedFolders,
   normalizeSyncFileRules,
   shouldSyncPath,
@@ -181,5 +183,43 @@ describe("device path policy", () => {
   it("shouldSyncPath without a device policy keeps the default path limits", () => {
     expect(shouldSyncPath(longName, DEFAULT_SYNC_FILE_RULES)).toBe(false);
     expect(shouldSyncPath("notes/what?.md", DEFAULT_SYNC_FILE_RULES)).toBe(true);
+  });
+});
+
+describe("folder rules", () => {
+  // Folders have no extension: the file-type toggles must not decide them. With
+  // "other files" off (the default) every folder used to be treated as excluded, so a
+  // folder emptied/deleted on one device was never removed on the others.
+  it("syncs ordinary folders regardless of the file-type toggles", () => {
+    const rules = { ...DEFAULT_SYNC_FILE_RULES, includeOtherFiles: false, includeImages: false };
+    expect(matchesSyncFolderRules("30-Resources/문해력", rules)).toBe(true);
+    expect(matchesSyncFolderRules("Notes/v1.2 drafts", rules)).toBe(true);
+    expect(shouldSyncPath("30-Resources/문해력", rules, undefined, "folder")).toBe(true);
+  });
+
+  it("still treats an extension-less path as a file by default", () => {
+    expect(shouldSyncPath("30-Resources/문해력", DEFAULT_SYNC_FILE_RULES)).toBe(false);
+    expect(matchesSyncEntryRules("30-Resources/문해력", DEFAULT_SYNC_FILE_RULES)).toBe(false);
+  });
+
+  it("excludes folders inside excluded folders", () => {
+    const rules = { ...DEFAULT_SYNC_FILE_RULES, excludedFolders: ["Archive"] };
+    expect(matchesSyncFolderRules("Archive", rules)).toBe(false);
+    expect(matchesSyncFolderRules("Archive/2025", rules)).toBe(false);
+    expect(matchesSyncFolderRules("Archived", rules)).toBe(true);
+  });
+
+  it("excludes hidden folders unless they are the synced Obsidian config tree", () => {
+    expect(matchesSyncFolderRules("Notes/.trash", DEFAULT_SYNC_FILE_RULES)).toBe(false);
+    expect(matchesSyncFolderRules(".obsidian/snippets", DEFAULT_SYNC_FILE_RULES)).toBe(false);
+    const withConfig = { ...DEFAULT_SYNC_FILE_RULES, includeObsidianConfig: true };
+    expect(matchesSyncFolderRules(".obsidian/snippets", withConfig)).toBe(true);
+    expect(matchesSyncFolderRules(".obsidian/plugins/osync", withConfig)).toBe(false);
+  });
+
+  it("matchesSyncEntryRules dispatches on the entry kind", () => {
+    expect(matchesSyncEntryRules("Notes/sub", DEFAULT_SYNC_FILE_RULES, "folder")).toBe(true);
+    expect(matchesSyncEntryRules("Notes/a.md", DEFAULT_SYNC_FILE_RULES, "file")).toBe(true);
+    expect(matchesSyncEntryRules("Notes/a.bin", DEFAULT_SYNC_FILE_RULES, "file")).toBe(false);
   });
 });
