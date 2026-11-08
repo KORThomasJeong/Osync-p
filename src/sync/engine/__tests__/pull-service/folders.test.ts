@@ -206,4 +206,75 @@ describe("SyncPullService folder entries", () => {
 
     await store.close();
   });
+
+  // Deletes arrive in apply windows. When a parent folder's delete lands in an earlier
+  // window than its subfolder's, the parent is not empty yet and stays; it must be
+  // removed once the subfolder goes, or the next scan pushes it back as a new folder.
+  it("removes a deleted parent folder once its deleted subfolder is removed in a later window", async () => {
+    const plugin = createTestPlugin();
+    const store = await createInitializedTestSyncStore(plugin);
+    const adapter = createVaultAdapter({}, ["Old", "Old/Sub"]);
+
+    for (const [entryId, path] of [
+      ["folder-parent", "Old"],
+      ["folder-child", "Old/Sub"],
+    ]) {
+      await store.upsertEntry({
+        entryId,
+        path,
+        revision: 1,
+        blobId: null,
+        hash: null,
+        deleted: false,
+        updatedAt: 1,
+        localMtime: null,
+        localSize: null,
+        entryType: "folder",
+      });
+    }
+
+    const deleteCommit = async (cursor: number, entryId: string, path: string) =>
+      createCommit({
+        cursor,
+        entryId,
+        op: "delete",
+        revision: 2,
+        baseRevision: 1,
+        blobId: null,
+        entryType: "folder",
+        encryptedMetadata: await encryptFolderMetadata({
+          entryId,
+          revision: 2,
+          deleted: true,
+          path,
+        }),
+      });
+
+    const session = createRealtimeSession({
+      pages: [
+        { cursor: 2, hasMore: true, commits: [await deleteCommit(2, "folder-parent", "Old")] },
+        { cursor: 3, hasMore: false, commits: [await deleteCommit(3, "folder-child", "Old/Sub")] },
+      ],
+    });
+
+    const service = new SyncPullService({
+      getApiBaseUrl: () => "http://127.0.0.1:8787",
+      getSyncToken: async () => createToken(),
+      getSyncStore: () => store,
+      crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+      vaultAdapter: adapter,
+      eventGate: createEventGate([]),
+      pullClient: createPullClient({ blobs: {} }),
+      onProgress: ignoreProgress,
+      applyWindowSize: 1,
+    });
+
+    await service.pullOnce(session);
+
+    expect(adapter.directories.has("Old/Sub")).toBe(false);
+    expect(adapter.directories.has("Old")).toBe(false);
+
+    await store.close();
+  });
 });
+

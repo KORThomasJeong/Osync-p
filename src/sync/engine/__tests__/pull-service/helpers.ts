@@ -384,7 +384,10 @@ export function createVaultAdapter(
       files.delete(path);
       directories.delete(path);
     },
-    async isFolderEmpty(path: string): Promise<boolean> {
+    async removeEmptyFolder(path: string): Promise<boolean> {
+      if (!directories.has(path)) {
+        return false;
+      }
       const prefix = path.endsWith("/") ? path : `${path}/`;
       for (const filePath of files.keys()) {
         if (filePath.startsWith(prefix)) {
@@ -396,6 +399,7 @@ export function createVaultAdapter(
           return false;
         }
       }
+      directories.delete(path);
       return true;
     },
   };

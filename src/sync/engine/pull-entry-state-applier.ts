@@ -114,7 +114,7 @@ export interface PullEntryStateVaultAdapter
   extends ConflictFileWriter,
     SyncVaultWriter {
   readBytes(path: string): Promise<Uint8Array>;
-  isFolderEmpty(path: string): Promise<boolean>;
+  removeEmptyFolder(path: string): Promise<boolean>;
 }
 
 export interface PullEntryStateStore
@@ -148,6 +148,9 @@ export class PullEntryStateApplier {
   private readonly blobPreparer: PullBlobPreparer;
   private readonly manifestPlanner: PullManifestPlanner;
   private readonly pendingMutations: PullPendingMutationHandler;
+  // Remotely deleted folders that still held something when their delete was applied,
+  // typically a subfolder whose own delete arrives in a later apply window.
+  private readonly leftoverDeletedFolders = new Set<string>();
 
   constructor(private readonly deps: PullEntryStateApplierDeps) {
     this.blobPreparer = new PullBlobPreparer(deps);
@@ -627,6 +630,7 @@ export class PullEntryStateApplier {
                 foldersToDelete.push(deletePath);
               }
             } else if (plan.finalPath) {
+              this.leftoverDeletedFolders.delete(plan.finalPath);
               if (this.isDiskWritablePath(plan.finalPath, "folder")) {
                 try {
                   if (!(await this.deps.vaultAdapter.exists(plan.finalPath))) {
@@ -820,11 +824,21 @@ export class PullEntryStateApplier {
   }
 
   private async safeDeleteFolder(path: string): Promise<void> {
-    if (
-      (await this.deps.vaultAdapter.exists(path)) &&
-      (await this.deps.vaultAdapter.isFolderEmpty(path))
-    ) {
-      await this.deps.vaultAdapter.remove(path);
+    if (!(await this.deps.vaultAdapter.removeEmptyFolder(path))) {
+      if (await this.deps.vaultAdapter.exists(path)) {
+        this.leftoverDeletedFolders.add(path);
+      }
+      return;
+    }
+
+    this.leftoverDeletedFolders.delete(path);
+    let parent = parentFolderPath(path);
+    while (parent && this.leftoverDeletedFolders.has(parent)) {
+      if (!(await this.deps.vaultAdapter.removeEmptyFolder(parent))) {
+        break;
+      }
+      this.leftoverDeletedFolders.delete(parent);
+      parent = parentFolderPath(parent);
     }
   }
 
@@ -889,4 +903,9 @@ function collectFolderPathsForSuppression(
     }
   }
   return paths;
+}
+
+function parentFolderPath(path: string): string | null {
+  const slashIndex = path.lastIndexOf("/");
+  return slashIndex > 0 ? path.slice(0, slashIndex) : null;
 }

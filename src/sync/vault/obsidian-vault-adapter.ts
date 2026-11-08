@@ -31,9 +31,25 @@ export class ObsidianSyncVaultAdapter {
     return asSyncableFolder(file, this.getSyncFileRules(), this.getDevicePathPolicy?.());
   }
 
-  async isFolderEmpty(path: string): Promise<boolean> {
-    const folder = this.plugin.app.vault.getAbstractFileByPath(path);
-    return !(folder instanceof TFolder) || folder.children.length === 0;
+  // Removes a folder whose only contents are OS metadata files, and reports whether it
+  // did. Reads the disk rather than Obsidian's file tree, which lags behind the file
+  // deletes made just before, and uses rmdir because adapter.remove() only deletes files.
+  async removeEmptyFolder(path: string): Promise<boolean> {
+    const adapter = this.plugin.app.vault.adapter;
+    if (!(await adapter.exists(path))) {
+      return false;
+    }
+
+    const listed = await adapter.list(path);
+    if (listed.folders.length > 0 || listed.files.some((file) => !isOsMetadataFile(file))) {
+      return false;
+    }
+
+    for (const file of listed.files) {
+      await adapter.remove(file);
+    }
+    await adapter.rmdir(path, false);
+    return true;
   }
 
   listFolders(): string[] {
@@ -151,4 +167,12 @@ export class ObsidianSyncVaultAdapter {
   async remove(path: string): Promise<void> {
     await this.plugin.app.vault.adapter.remove(path);
   }
+}
+
+// Files the OS drops into folders on its own (Finder, Explorer). They are never synced,
+// so they must not keep a folder that was deleted remotely alive on this device.
+const OS_METADATA_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+
+function isOsMetadataFile(path: string): boolean {
+  return OS_METADATA_FILE_NAMES.has(path.slice(path.lastIndexOf("/") + 1));
 }

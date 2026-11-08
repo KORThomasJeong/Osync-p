@@ -79,7 +79,7 @@ function createService(input: {
   store: SyncStore;
   adapter: Pick<
     VaultAdapter,
-    "exists" | "mkdir" | "readBytes" | "writeText" | "writeBinary" | "remove" | "isFolderEmpty"
+    "exists" | "mkdir" | "readBytes" | "writeText" | "writeBinary" | "remove" | "removeEmptyFolder"
   >;
   blobs: Record<string, Uint8Array>;
   policy?: DevicePathPolicy;
