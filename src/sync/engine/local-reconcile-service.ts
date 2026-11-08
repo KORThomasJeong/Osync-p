@@ -365,7 +365,9 @@ export class SyncLocalReconcileService {
         continue;
       }
       const remote = await store.getRemoteStateById(entry.entryId);
-      if (!remote || remote.revision === 0) {
+      // Never synced, or already deleted on the server (a folder kept on disk after a
+      // pulled delete): nothing to tell the server, just forget the local record.
+      if (!remote || remote.revision === 0 || remote.deleted) {
         await store.markEntryClean(entry.entryId);
         await store.deleteEntry(entry.entryId);
         continue;

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { VaultKeyCryptoService } from "../../../core/crypto-service";
 
 import { SyncPullService } from "../../pull-service";
+import { SyncLocalReconcileService } from "../../local-reconcile-service";
 import {
   createInitializedTestSyncStore,
   createTestPlugin,
@@ -273,6 +274,88 @@ describe("SyncPullService folder entries", () => {
 
     expect(adapter.directories.has("Old/Sub")).toBe(false);
     expect(adapter.directories.has("Old")).toBe(false);
+
+    await store.close();
+  });
+
+  // A folder deleted remotely but still holding files this device does not sync
+  // (another extension, OS leftovers) stays on disk. The next scan must not push it
+  // back as a new folder, and removing it later must not send a second delete.
+  it("does not re-create a remotely deleted folder that could not be removed locally", async () => {
+    const plugin = createTestPlugin();
+    const store = await createInitializedTestSyncStore(plugin);
+    const adapter = createVaultAdapter({ "Old/script.py": "unsynced" }, ["Old"]);
+
+    await store.upsertEntry({
+      entryId: "folder-old",
+      path: "Old",
+      revision: 1,
+      blobId: null,
+      hash: null,
+      deleted: false,
+      updatedAt: 1,
+      localMtime: null,
+      localSize: null,
+      entryType: "folder",
+    });
+
+    const session = createRealtimeSession({
+      pages: [
+        {
+          cursor: 2,
+          hasMore: false,
+          commits: [
+            createCommit({
+              cursor: 2,
+              entryId: "folder-old",
+              op: "delete",
+              revision: 2,
+              baseRevision: 1,
+              blobId: null,
+              entryType: "folder",
+              encryptedMetadata: await encryptFolderMetadata({
+                entryId: "folder-old",
+                revision: 2,
+                deleted: true,
+                path: "Old",
+              }),
+            }),
+          ],
+        },
+      ],
+    });
+
+    await new SyncPullService({
+      getApiBaseUrl: () => "http://127.0.0.1:8787",
+      getSyncToken: async () => createToken(),
+      getSyncStore: () => store,
+      crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+      vaultAdapter: adapter,
+      eventGate: createEventGate([]),
+      pullClient: createPullClient({ blobs: {} }),
+      onProgress: ignoreProgress,
+    }).pullOnce(session);
+
+    expect(adapter.directories.has("Old")).toBe(true);
+
+    const reconcile = (folders: string[]) =>
+      new SyncLocalReconcileService({
+        getSyncStore: () => store,
+        crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+        shouldSyncPath: (path) => !path.endsWith(".py"),
+        scanner: {
+          async listFiles() {
+            return [];
+          },
+          listFolders: () => folders,
+        },
+      }).reconcileOnce();
+
+    await reconcile(["Old"]);
+    expect(await store.listDirtyEntries()).toEqual([]);
+
+    await reconcile([]);
+    expect(await store.listDirtyEntries()).toEqual([]);
 
     await store.close();
   });

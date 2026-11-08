@@ -618,7 +618,7 @@ export class PullEntryStateApplier {
           }
 
           // Folder pass: create new folders and safe-delete removed/renamed ones.
-          const foldersToDelete: string[] = [];
+          const foldersToDelete: { path: string; deletedEntryId: string | null }[] = [];
           for (const plan of prepared.plans) {
             if (plan.state.entryType !== "folder") {
               continue;
@@ -627,7 +627,7 @@ export class PullEntryStateApplier {
             if (plan.state.deleted) {
               const deletePath = plan.existing?.path ?? plan.metadata.path;
               if (deletePath && this.isDiskWritablePath(deletePath, "folder")) {
-                foldersToDelete.push(deletePath);
+                foldersToDelete.push({ path: deletePath, deletedEntryId: plan.state.entryId });
               }
             } else if (plan.finalPath) {
               this.leftoverDeletedFolders.delete(plan.finalPath);
@@ -657,20 +657,23 @@ export class PullEntryStateApplier {
               }
               const oldPath = plan.existing?.path;
               if (oldPath && oldPath !== plan.finalPath && this.isDiskWritablePath(oldPath, "folder")) {
-                foldersToDelete.push(oldPath);
+                foldersToDelete.push({ path: oldPath, deletedEntryId: null });
               }
             }
           }
 
           if (!skipDeletions) {
             foldersToDelete.sort((a, b) => {
-              const aDepth = (a.match(/\//g) ?? []).length;
-              const bDepth = (b.match(/\//g) ?? []).length;
+              const aDepth = (a.path.match(/\//g) ?? []).length;
+              const bDepth = (b.path.match(/\//g) ?? []).length;
               return bDepth - aDepth;
             });
-            for (const folderPath of foldersToDelete) {
+            for (const { path: folderPath, deletedEntryId } of foldersToDelete) {
               try {
-                await this.safeDeleteFolder(folderPath);
+                const kept = await this.safeDeleteFolder(folderPath);
+                if (kept && deletedEntryId) {
+                  await this.keepDeletedFolderLocal(store, deletedEntryId, folderPath);
+                }
               } catch (error) {
                 console.warn(`[osync] pull: could not remove folder ${folderPath}`, error);
               }
@@ -823,12 +826,14 @@ export class PullEntryStateApplier {
     }
   }
 
-  private async safeDeleteFolder(path: string): Promise<void> {
+  // Returns true when the folder had to stay on disk because it still holds something.
+  private async safeDeleteFolder(path: string): Promise<boolean> {
     if (!(await this.deps.vaultAdapter.removeEmptyFolder(path))) {
       if (await this.deps.vaultAdapter.exists(path)) {
         this.leftoverDeletedFolders.add(path);
+        return true;
       }
-      return;
+      return false;
     }
 
     this.leftoverDeletedFolders.delete(path);
@@ -840,6 +845,27 @@ export class PullEntryStateApplier {
       this.leftoverDeletedFolders.delete(parent);
       parent = parentFolderPath(parent);
     }
+    return false;
+  }
+
+  // A remotely deleted folder that stays on disk is recorded as still present locally,
+  // so the next scan treats it as known instead of pushing it back as a new folder.
+  private async keepDeletedFolderLocal(
+    store: PullEntryStateStore,
+    entryId: string,
+    path: string,
+  ): Promise<void> {
+    await store.applyLocalState({
+      entryId,
+      path,
+      blobId: null,
+      hash: null,
+      entryType: "folder",
+      deleted: false,
+      updatedAt: Date.now(),
+      localMtime: null,
+      localSize: null,
+    });
   }
 
   private async runWithSuppressedPaths<T>(
