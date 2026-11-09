@@ -44,6 +44,9 @@ export interface LocalFileScanner {
   // Paths (a file, or a folder and everything under it) the last listFiles() could not
   // scan. Known entries there are left alone instead of being taken for deleted.
   listUnscannedPaths?(): string[];
+  // Whether a path is on disk. The file list comes from the app's index, which can miss
+  // a file that exists (e.g. one the pull just wrote that the index has not picked up).
+  exists?(path: string): Promise<boolean>;
 }
 
 export interface SyncLocalReconcileServiceDeps {
@@ -279,6 +282,7 @@ export class SyncLocalReconcileService {
       );
     }
 
+    const stillOnDiskPaths: string[] = [];
     for (const entry of knownEntries) {
       if (
         entry.deleted ||
@@ -288,6 +292,11 @@ export class SyncLocalReconcileService {
         reusedEntryIds.has(entry.entryId) ||
         entry.entryType === "folder"
       ) {
+        continue;
+      }
+      if (await this.deps.scanner.exists?.(entry.path)) {
+        // Missing from the listing but still on disk: never send a delete for it.
+        stillOnDiskPaths.push(entry.path);
         continue;
       }
 
@@ -385,6 +394,11 @@ export class SyncLocalReconcileService {
       if (entry.deleted || !entry.path || localFolderPathKeys.has(toPathKey(entry.path))) {
         continue;
       }
+      if (await this.deps.scanner.exists?.(entry.path)) {
+        // Missing from the listing but still on disk (the app has not indexed it yet).
+        stillOnDiskPaths.push(entry.path);
+        continue;
+      }
       const remote = await store.getRemoteStateById(entry.entryId);
       // Never synced, or already deleted on the server (a folder kept on disk after a
       // pulled delete): nothing to tell the server, just forget the local record.
@@ -413,6 +427,12 @@ export class SyncLocalReconcileService {
         localSize: null,
       });
       filesQueuedForDelete += 1;
+    }
+
+    if (stillOnDiskPaths.length > 0) {
+      console.warn(
+        `[osync] reconcile: ${stillOnDiskPaths.length} path(s) missing from the vault listing are still on disk; not deleting them (e.g. ${stillOnDiskPaths[0]})`,
+      );
     }
 
     await store.flush();

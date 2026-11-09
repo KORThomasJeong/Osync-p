@@ -341,4 +341,96 @@ describe("SyncPullService pending upsert conflict resolution", () => {
 
     await store.close();
   });
+  it("lets the synced config replace a config file this device created before syncing", async () => {
+    // Obsidian writes default settings into a new vault before Osync connects; the
+    // vault's synced settings must win instead of being pushed over.
+    const plugin = createTestPlugin();
+    const store = await createInitializedTestSyncStore(plugin);
+    const localDefault = "{}";
+    const remoteBody = '{"theme":"obsidian"}';
+    const adapter = createVaultAdapter({ ".obsidian/appearance.json": localDefault });
+    const localHash = await hashText(localDefault);
+    const remoteHash = await hashText(remoteBody);
+    await store.applyLocalState({
+      entryId: "local-appearance",
+      path: ".obsidian/appearance.json",
+      blobId: "blob-local",
+      hash: localHash,
+      deleted: false,
+      updatedAt: Date.now(),
+      localMtime: 1,
+      localSize: 2,
+    });
+    await store.markEntryDirty({
+      mutationId: "mutation-local-appearance",
+      entryId: "local-appearance",
+      op: "upsert",
+      baseRevision: 0,
+      blobId: "blob-local",
+      hash: localHash,
+      encryptedMetadata: await encryptPendingMetadata({
+        entryId: "local-appearance",
+        baseRevision: 0,
+        op: "upsert",
+        blobId: "blob-local",
+        path: ".obsidian/appearance.json",
+        hash: localHash,
+        editedAt: Date.now(),
+      }),
+      createdAt: Date.now(),
+    });
+
+    const session = createRealtimeSession({
+      pages: [
+        {
+          cursor: 1,
+          hasMore: false,
+          commits: [
+            createCommit({
+              cursor: 1,
+              entryId: "remote-appearance",
+              revision: 1,
+              blobId: "blob-remote",
+              encryptedMetadata: await encryptRemoteMetadata({
+                entryId: "remote-appearance",
+                revision: 1,
+                blobId: "blob-remote",
+                path: ".obsidian/appearance.json",
+                hash: remoteHash,
+                editedAt: 1,
+              }),
+            }),
+          ],
+        },
+      ],
+    });
+    const client = createPullClient({
+      blobs: {
+        "blob-remote": await encryptTestBlob("blob-remote", new TextEncoder().encode(remoteBody)),
+      },
+    });
+    const service = new SyncPullService({
+      getApiBaseUrl: () => "http://127.0.0.1:8787",
+      getSyncToken: async () => createToken(),
+      getSyncStore: () => store,
+      crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+      vaultAdapter: adapter,
+      pullClient: client,
+      onProgress: ignoreProgress,
+      now: conflictTimestamp,
+    });
+
+    await service.pullOnce(session);
+
+    expect(adapter.text(".obsidian/appearance.json")).toBe(remoteBody);
+    // The device's blank default is dropped, not kept as a conflict copy.
+    expect(adapter.text(".obsidian/appearance.sync-conflict-20260422-101112.json")).toBeNull();
+    expect(await store.listDirtyEntries()).toEqual([]);
+    expect((await store.getEntryByPath(".obsidian/appearance.json"))?.entryId).toBe(
+      "remote-appearance",
+    );
+
+    await store.close();
+  });
 });
+

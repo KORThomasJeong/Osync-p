@@ -471,5 +471,42 @@ describe("SyncPullService folder entries", () => {
 
     await store.close();
   });
+  it("does not delete a file that is missing from the vault listing but still on disk", async () => {
+    const plugin = createTestPlugin();
+    const store = await createInitializedTestSyncStore(plugin);
+    await store.upsertEntry({
+      entryId: "note",
+      path: "Notes/a.md",
+      revision: 1,
+      blobId: "blob-a",
+      hash: "hash-a",
+      deleted: false,
+      updatedAt: 1,
+      localMtime: 1,
+      localSize: 1,
+    });
+
+    const reconcile = (onDisk: boolean) =>
+      new SyncLocalReconcileService({
+        getSyncStore: () => store,
+        crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+        shouldSyncPath: () => true,
+        scanner: {
+          async listFiles() {
+            return [];
+          },
+          listFolders: () => [],
+          exists: async () => onDisk,
+        },
+      }).reconcileOnce({ allowMassDelete: true });
+
+    await reconcile(true);
+    expect(await store.listDirtyEntries()).toEqual([]);
+
+    await reconcile(false);
+    expect(await store.listDirtyEntries()).toMatchObject([{ entryId: "note", op: "delete" }]);
+
+    await store.close();
+  });
 });
 

@@ -328,7 +328,12 @@ export class PullManifestPlanner {
     return {
       entry: pathOwner,
       pending,
-      hashMatches: pendingMetadata.hash === remoteHash && pathOwner.hash === remoteHash,
+      // A config file this device created itself before ever syncing it (Obsidian writes
+      // its defaults into a new vault) yields to the synced one, so a new device takes the
+      // vault's settings instead of pushing its blank defaults over them.
+      hashMatches:
+        isObsidianConfigPath(metadata.path) ||
+        (pendingMetadata.hash === remoteHash && pathOwner.hash === remoteHash),
     };
   }
 
@@ -408,3 +413,7 @@ export class PullManifestPlanner {
 export interface PullManifestStore
   extends Pick<SyncEntryStore, "getEntryById" | "getEntryByPath">,
     Pick<SyncMutationStore, "getDirtyEntryMutation" | "replaceDirtyEntry"> {}
+
+function isObsidianConfigPath(path: string): boolean {
+  return path.startsWith(".obsidian/");
+}
