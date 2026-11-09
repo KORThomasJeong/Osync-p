@@ -317,6 +317,33 @@ export class DexieSyncStore implements SyncStore {
       new Set(operations.map((op) => op.entry.entryId)),
     );
 
+    try {
+      await this.bulkApplyInOneTransaction(operations, ids);
+    } catch (error) {
+      if (!isConstraintError(error)) {
+        throw error;
+      }
+      // bulkPut cannot merge a path-key collision (e.g. a file the scan recorded under
+      // its own entry ID meets the server's entry for the same path), so one such row
+      // fails the whole batch and the pull retries it forever. Apply the batch one
+      // entry at a time instead, where putEntry merges the colliding rows.
+      console.warn(
+        `[osync] bulkApply: path-key collision in a batch of ${operations.length}; applying one by one`,
+      );
+      for (const op of operations) {
+        if (op.kind === "applyRemote") {
+          await this.applyRemoteState(op.entry);
+        } else {
+          await this.upsertEntry(op.entry);
+        }
+      }
+    }
+  }
+
+  private async bulkApplyInOneTransaction(
+    operations: readonly BulkEntryApplyOp[],
+    ids: string[],
+  ): Promise<void> {
     await this.db.transaction("rw", this.db.entries, async () => {
       const existingRows = await this.db.entries.bulkGet(ids);
       const recordById = new Map<string, EntryRecord>();
@@ -679,5 +706,8 @@ function isConstraintError(error: unknown): boolean {
   if (typeof name === "string" && name === "ConstraintError") return true;
   const message = (error as { message?: unknown }).message;
   if (typeof message === "string" && /not unique/i.test(message)) return true;
+  // Dexie wraps bulkPut failures in a BulkError that lists the per-row errors.
+  const failures = (error as { failures?: unknown }).failures;
+  if (Array.isArray(failures)) return failures.some((failure) => isConstraintError(failure));
   return false;
 }

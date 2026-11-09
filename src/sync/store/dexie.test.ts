@@ -754,6 +754,63 @@ describe("DexieSyncStore.bulkApply", () => {
     await serialStore.close();
     await bulkStore.close();
   });
+
+  it("merges a path-key collision instead of failing the whole batch", async () => {
+    const plugin = createPlugin();
+    const store = await createDexieSyncStore(plugin);
+
+    // A file the startup scan recorded under its own entry ID, before the pull
+    // brings the server's entry for the same path.
+    await store.applyLocalState({
+      entryId: "local-only",
+      path: "Notes/same.md",
+      blobId: null,
+      hash: "hash-same",
+      entryType: "file",
+      deleted: false,
+      updatedAt: 1,
+      localMtime: 1,
+      localSize: 4,
+    });
+
+    await expect(
+      store.bulkApply([
+        {
+          kind: "upsert",
+          entry: {
+            entryId: "remote-same",
+            path: "Notes/same.md",
+            revision: 1,
+            blobId: "blob-same",
+            hash: "hash-same",
+            deleted: false,
+            updatedAt: 2,
+            localMtime: 1,
+            localSize: 4,
+          },
+        },
+        {
+          kind: "upsert",
+          entry: {
+            entryId: "remote-other",
+            path: "Notes/other.md",
+            revision: 1,
+            blobId: "blob-other",
+            hash: "hash-other",
+            deleted: false,
+            updatedAt: 2,
+            localMtime: 1,
+            localSize: 4,
+          },
+        },
+      ]),
+    ).resolves.toBeUndefined();
+
+    expect((await store.getEntryByPath("Notes/same.md"))?.entryId).toBe("remote-same");
+    expect(await store.getEntryById("remote-other")).toMatchObject({ path: "Notes/other.md" });
+
+    await store.close();
+  });
 });
 
 describe("clearDexieSyncStore robustness", () => {
