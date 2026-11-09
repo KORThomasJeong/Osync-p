@@ -137,6 +137,10 @@ export class SyncEngine {
   private readonly syncErrorEscalator = new SyncErrorEscalator();
   private lastActionableMessage: string | null = null;
   private localMutationQueue: Promise<void> = Promise.resolve();
+  // Pulls and local scans never overlap: a scan running during a pull sees the files the
+  // pull has written to disk but not yet recorded, and queues them as new local files
+  // (the server rejects those creates as path collisions, and the device never settles).
+  private scanPullQueue: Promise<void> = Promise.resolve();
   private activeSyncActivities: ActiveSyncActivity[] = [];
   private nextSyncActivityId = 1;
   private readonly syncEventGate = new SyncEventGate((path) =>
@@ -508,8 +512,19 @@ export class SyncEngine {
     allowMassDelete?: boolean;
   }): Promise<ReconcileOnceResult> {
     return await this.runLocalMutationWork(async () => {
-      return await this.syncLocalReconcileService.reconcileOnce(options);
+      return await this.runExclusiveOfPull(
+        async () => await this.syncLocalReconcileService.reconcileOnce(options),
+      );
     });
+  }
+
+  private runExclusiveOfPull<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.scanPullQueue.then(work, work);
+    this.scanPullQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   async isInitialPullRequired(): Promise<boolean> {
@@ -762,6 +777,10 @@ export class SyncEngine {
   }
 
   private async pullWithActivity(session: SyncRealtimeSession): Promise<PullOnceResult> {
+    return await this.runExclusiveOfPull(() => this.pullWithActivityUnlocked(session));
+  }
+
+  private async pullWithActivityUnlocked(session: SyncRealtimeSession): Promise<PullOnceResult> {
     return await this.withSyncActivity("pull", async () => {
       this.newDeviceIssuesThisPull = 0;
       this.newUnreadableThisPull = 0;
@@ -1078,9 +1097,12 @@ export class SyncEngine {
           `Re-uploading ${detached} file${detached === 1 ? "" : "s"} as new entries: their server entries were removed or unreadable`,
         );
       }
-      const result = await this.syncLocalReconcileService.reconcileOnce({
-        sanitizePendingMetadata: dropped > 0,
-      });
+      const result = await this.runExclusiveOfPull(
+        async () =>
+          await this.syncLocalReconcileService.reconcileOnce({
+            sanitizePendingMetadata: dropped > 0,
+          }),
+      );
       this.recordActivity(
         "scan",
         `Re-scan: ${result.filesQueuedForUpsert} upserts, ${result.filesQueuedForDelete} deletes queued (${result.filesScanned} scanned)`,

@@ -307,6 +307,39 @@ describe("SyncEngine", () => {
     });
   });
 
+  it("does not run a local scan while a pull is applying", async () => {
+    // A scan during a pull sees files the pull wrote but has not recorded yet and
+    // queues them as new local files (the server then rejects them as path collisions).
+    const engine = createEngine(createPlugin({}, async () => encodeUtf8("")));
+    const internals = engine as unknown as {
+      syncPullService: { pullOnce: (session: unknown) => Promise<unknown> };
+      syncLocalReconcileService: { reconcileOnce: (options?: unknown) => Promise<unknown> };
+      syncAutoLoop: { deps: { pullOnce: (session: unknown) => Promise<unknown> } };
+    };
+    const pullRelease = createDeferred<void>();
+    const order: string[] = [];
+    vi.spyOn(internals.syncPullService, "pullOnce").mockImplementation(async () => {
+      order.push("pull:start");
+      await pullRelease.promise;
+      order.push("pull:end");
+      return { cursor: 1, entriesApplied: 0, filesWritten: 0, filesDeleted: 0, conflictsCreated: 0 };
+    });
+    vi.spyOn(internals.syncLocalReconcileService, "reconcileOnce").mockImplementation(async () => {
+      order.push("scan");
+      return { filesScanned: 0, filesQueuedForUpsert: 0, filesQueuedForDelete: 0 };
+    });
+
+    const pull = internals.syncAutoLoop.deps.pullOnce({});
+    await nextTask();
+    const scan = engine.reconcileOnce();
+    await nextTask();
+    expect(order).toEqual(["pull:start"]);
+
+    pullRelease.resolve();
+    await Promise.all([pull, scan]);
+    expect(order).toEqual(["pull:start", "pull:end", "scan"]);
+  });
+
   describe("activity recording", () => {
     type ActivityLoopDeps = {
       pullOnce: (session: unknown) => Promise<unknown>;
