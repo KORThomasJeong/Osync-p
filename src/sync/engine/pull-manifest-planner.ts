@@ -143,6 +143,10 @@ export class PullManifestPlanner {
         if (state.entryType === "folder") {
           finalPath = metadata.path;
           hash = null;
+          const pathOwner = await store.getEntryByPath(metadata.path);
+          adoptedLocalEntry = pathOwner
+            ? await this.findAdoptableLocalFolder(store, state, metadata, pathOwner)
+            : null;
         } else {
           if (!state.blobId) {
             throw new Error(`Entry state ${state.entryId}@${state.revision} is missing a blob.`);
@@ -326,6 +330,34 @@ export class PullManifestPlanner {
       pending,
       hashMatches: pendingMetadata.hash === remoteHash && pathOwner.hash === remoteHash,
     };
+  }
+
+  // A folder this device recorded under its own entry ID before the server's entry for
+  // the same folder arrived (e.g. the pull created it as the parent of a file from an
+  // earlier window). Folders have no content, so the remote entry simply takes it over;
+  // otherwise its row keeps the local path key and the pull can never write the remote one.
+  private async findAdoptableLocalFolder(
+    store: PullManifestStore,
+    state: RemoteEntryState,
+    metadata: SyncedEntryMetadata,
+    pathOwner: SyncEntryRow,
+  ): Promise<AdoptedLocalEntry | null> {
+    if (
+      pathOwner.entryId === state.entryId ||
+      pathOwner.entryType !== "folder" ||
+      pathOwner.revision !== 0 ||
+      pathOwner.deleted ||
+      pathOwner.path !== metadata.path
+    ) {
+      return null;
+    }
+
+    const pending = await store.getDirtyEntryMutation(pathOwner.entryId);
+    if (pending && pending.op !== "upsert") {
+      return null;
+    }
+
+    return { entry: pathOwner, pending, hashMatches: true };
   }
 
   private async createPathCollisionEvent(

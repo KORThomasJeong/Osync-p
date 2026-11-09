@@ -84,7 +84,10 @@ export class PullPendingMutationHandler {
       clientRevision: pending.baseRevision + 1,
     });
 
-    if (winner === "client") {
+    // Rebasing onto the remote revision only works for the same entry: a queued change
+    // of another entry at this path would commit with a base its own entry never had,
+    // and the server rejects it as stale on every push.
+    if (winner === "client" && pending.entryId === plan.state.entryId) {
       let backupPath: string | null = null;
       let backupBytes: Uint8Array | null = null;
       if (
@@ -127,7 +130,11 @@ export class PullPendingMutationHandler {
 
     let conflictPath: string | null = null;
     let conflictBytes: Uint8Array | null = null;
-    if (pending.op === "upsert" && (await this.deps.vaultAdapter.exists(metadata.path))) {
+    if (
+      pending.op === "upsert" &&
+      pending.entryType !== "folder" &&
+      (await this.deps.vaultAdapter.exists(metadata.path))
+    ) {
       conflictBytes = await this.deps.vaultAdapter.readBytes(metadata.path);
       conflictPath = await getAvailableConflictCopyPath(
         this.deps.vaultAdapter,

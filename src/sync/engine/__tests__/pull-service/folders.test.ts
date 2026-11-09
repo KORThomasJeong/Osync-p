@@ -359,5 +359,80 @@ describe("SyncPullService folder entries", () => {
 
     await store.close();
   });
+  it("drops a local pending folder create when the server already has that folder under another entry", async () => {
+    // A fresh device: the pull wrote a file under "Projects/app" before the folder's own
+    // entry arrived, so the folder event recorded a local create under a new entry ID.
+    const plugin = createTestPlugin();
+    const store = await createInitializedTestSyncStore(plugin);
+    const adapter = createVaultAdapter({}, ["Projects/app"]);
+
+    await store.applyLocalState({
+      entryId: "local-folder",
+      path: "Projects/app",
+      blobId: null,
+      hash: null,
+      deleted: false,
+      updatedAt: 1,
+      localMtime: null,
+      localSize: null,
+      entryType: "folder",
+    });
+    await store.markEntryDirty({
+      mutationId: "mutation-local-folder",
+      entryId: "local-folder",
+      op: "upsert",
+      baseRevision: 0,
+      blobId: null,
+      hash: null,
+      encryptedMetadata: await encryptFolderMetadata({
+        entryId: "local-folder",
+        revision: 1,
+        path: "Projects/app",
+      }),
+      createdAt: 2,
+      entryType: "folder",
+    });
+
+    const session = createRealtimeSession({
+      pages: [
+        {
+          cursor: 1,
+          hasMore: false,
+          commits: [
+            createCommit({
+              cursor: 1,
+              entryId: "remote-folder",
+              revision: 1,
+              blobId: null,
+              entryType: "folder",
+              encryptedMetadata: await encryptFolderMetadata({
+                entryId: "remote-folder",
+                revision: 1,
+                path: "Projects/app",
+              }),
+            }),
+          ],
+        },
+      ],
+    });
+    const service = new SyncPullService({
+      getApiBaseUrl: () => "http://127.0.0.1:8787",
+      getSyncToken: async () => createToken(),
+      getSyncStore: () => store,
+      crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+      vaultAdapter: adapter,
+      pullClient: createPullClient({ blobs: {} }),
+      onProgress: ignoreProgress,
+    });
+
+    await service.pullOnce(session);
+
+    // Pushing the local create would be rejected forever (its entry is not on the server).
+    expect(await store.listDirtyEntries()).toEqual([]);
+    expect((await store.getEntryByPath("Projects/app"))?.entryId).toBe("remote-folder");
+    expect(adapter.directories.has("Projects/app")).toBe(true);
+
+    await store.close();
+  });
 });
 

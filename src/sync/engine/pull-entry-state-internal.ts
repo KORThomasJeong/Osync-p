@@ -39,7 +39,8 @@ export type PlannedEntryState = {
 
 export type AdoptedLocalEntry = {
   entry: SyncEntryRow;
-  pending: PendingMutationRow;
+  // null only for an adopted folder that had no queued create.
+  pending: PendingMutationRow | null;
   hashMatches: boolean;
 };
 

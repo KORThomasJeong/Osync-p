@@ -718,7 +718,7 @@ export class PullEntryStateApplier {
         continue;
       }
 
-      if (adoption.hashMatches) {
+      if (adoption.hashMatches && adoption.pending) {
         await store.clearDirtyEntryByMutationId(adoption.pending.mutationId);
       }
       await store.deleteEntry(adoption.entry.entryId);
