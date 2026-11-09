@@ -65,7 +65,7 @@ export interface SyncLocalReconcileStore
       SyncLocalEntryStore,
       "applyLocalState" | "clearLocalState" | "getLocalStateByPath" | "listLocalStates"
     >,
-    Pick<SyncRemoteEntryStore, "getRemoteStateById">,
+    Pick<SyncRemoteEntryStore, "getRemoteStateById" | "getRemoteStateByPath">,
     Pick<
       SyncMutationStore,
       | "clearDirtyEntryByMutationId"
@@ -335,6 +335,27 @@ export class SyncLocalReconcileService {
     for (const folderPath of localFolderPaths) {
       if (!knownFolderPathKeys.has(toPathKey(folderPath))) {
         const existing = await store.getLocalStateByPath(folderPath);
+        if (!existing) {
+          // The server already has this folder and only its remote side is recorded here
+          // (e.g. the pull created it as a file's parent). Record it as present instead of
+          // queueing a create under a new entry ID, which the server rejects as a path
+          // collision on every scan.
+          const remoteAtPath = await store.getRemoteStateByPath(folderPath);
+          if (remoteAtPath && !remoteAtPath.deleted && remoteAtPath.entryType === "folder") {
+            await store.applyLocalState({
+              entryId: remoteAtPath.entryId,
+              path: folderPath,
+              blobId: null,
+              hash: null,
+              entryType: "folder",
+              deleted: false,
+              updatedAt: Date.now(),
+              localMtime: null,
+              localSize: null,
+            });
+            continue;
+          }
+        }
         const remote = existing ? await store.getRemoteStateById(existing.entryId) : null;
         const entryId =
           existing?.entryId ?? remote?.entryId ?? (await store.getOrCreateEntryId(folderPath));

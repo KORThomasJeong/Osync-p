@@ -434,5 +434,42 @@ describe("SyncPullService folder entries", () => {
 
     await store.close();
   });
+  it("records a folder the server already has instead of queueing a colliding create", async () => {
+    // Only the remote side is known (the pull recorded it without a local row); the
+    // folder exists on disk. A create under a new entry ID would be rejected by the
+    // server as a path collision, dropped, and queued again on every scan.
+    const plugin = createTestPlugin();
+    const store = await createInitializedTestSyncStore(plugin);
+    await store.applyRemoteState({
+      entryId: "remote-folder",
+      path: "Projects/app",
+      revision: 1,
+      blobId: null,
+      hash: null,
+      deleted: false,
+      updatedAt: 1,
+      entryType: "folder",
+    });
+
+    await new SyncLocalReconcileService({
+      getSyncStore: () => store,
+      crypto: new VaultKeyCryptoService(() => TEST_VAULT_KEY),
+      shouldSyncPath: () => true,
+      scanner: {
+        async listFiles() {
+          return [];
+        },
+        listFolders: () => ["Projects/app"],
+      },
+    }).reconcileOnce();
+
+    expect(await store.listDirtyEntries()).toEqual([]);
+    expect(await store.getLocalStateById("remote-folder")).toMatchObject({
+      path: "Projects/app",
+      deleted: false,
+    });
+
+    await store.close();
+  });
 });
 

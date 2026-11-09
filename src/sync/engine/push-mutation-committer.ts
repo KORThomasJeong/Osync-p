@@ -118,6 +118,18 @@ export class PushMutationCommitter {
     try {
       bytes = await this.deps.fileReader.readBytes(metadata.path);
     } catch (error) {
+      if (isDirectoryReadError(error)) {
+        // The path is a folder on disk: this file change can never be read, and keeping it
+        // queued retries it on every push. Drop it; the folder scan records the folder.
+        console.warn(
+          `[osync] push: ${metadata.path} is a folder on disk; dropped its queued file change`,
+        );
+        await store.clearDirtyEntryByMutationId(mutation.mutationId);
+        if (mutation.baseRevision === 0) {
+          await store.deleteEntry(mutation.entryId);
+        }
+        return { skipped: true, reason: "local_read_failed" };
+      }
       // One unreadable file must not fail the whole push: keep its change queued.
       console.warn(
         `[osync] push: could not read ${metadata.path}; its change stays queued`,
@@ -542,8 +554,24 @@ export class PushMutationCommitter {
     const remoteEntryId = isPathAlreadyExistsRejection(error)
       ? error.conflictingEntryId
       : null;
+    const local = await store.getLocalStateById(mutation.entryId);
     await store.clearDirtyEntryByMutationId(mutation.mutationId);
     await store.deleteEntry(mutation.entryId);
+    if (remoteEntryId && mutation.entryType === "folder" && local?.path && !local.deleted) {
+      // The folder is still on disk: record it under the server's entry, or the next
+      // scan sees an unknown folder and queues the same colliding create again.
+      await store.applyLocalState({
+        entryId: remoteEntryId,
+        path: local.path,
+        blobId: null,
+        hash: null,
+        entryType: "folder",
+        deleted: false,
+        updatedAt: Date.now(),
+        localMtime: null,
+        localSize: null,
+      });
+    }
     if (remoteEntryId) {
       console.warn(
         `[osync] adopted remote entryId=${remoteEntryId} for path collision; dropped local entryId=${mutation.entryId}`,
@@ -643,5 +671,13 @@ function isQuotaExceededUploadError(error: unknown): boolean {
     error instanceof SyncBlobUploadError &&
     error.status === 413 &&
     error.code === "quota_exceeded"
+  );
+}
+
+function isDirectoryReadError(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    (error as { code?: unknown }).code === "EISDIR"
   );
 }
