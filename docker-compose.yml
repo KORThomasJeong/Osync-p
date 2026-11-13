@@ -34,13 +34,18 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio
+    # minio/minio can no longer be pulled from Docker Hub; pgsty/silo is a maintained
+    # drop-in MinIO fork (same MINIO_* variables, S3 API and data format). The
+    # non-distroless tag ships curl, which the healthcheck below needs.
+    image: pgsty/silo:RELEASE.2026-10-26T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
       MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY}
       MINIO_KMS_AUTO_ENCRYPTION: "on"
+      # Public URL clients use for presigned uploads/downloads; must match S3_PUBLIC_ENDPOINT.
+      MINIO_SERVER_URL: ${MINIO_PUBLIC_URL:-}
     volumes:
       - minio_data:/data
     ports:

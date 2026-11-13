@@ -77,6 +77,13 @@ SYNC_TOKEN_SECRET=${SYNC_TOKEN_SECRET}
 PORT=3000
 PUBLIC_URL=${PUBLIC_URL}
 CORS_ORIGIN=${PUBLIC_URL}
+
+# Public URL of MinIO for presigned blob transfers, e.g. https://osync-s3.example.com
+# Set both to the same value, then run: docker compose up -d
+# Empty = only clients on this host can upload/download blobs.
+S3_PUBLIC_ENDPOINT=
+MINIO_PUBLIC_URL=
+
 SELF_HOSTED=true
 SYNC_TOKEN_TTL_SECONDS=120
 COORDINATOR_DATA_DIR=/data/coordinators
